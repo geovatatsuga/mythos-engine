@@ -1,5 +1,6 @@
 
 import React, { useState } from 'react';
+import { hasAllApiKeys, loadApiKeys } from '../utils/apiKeys';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { Universe, View, GenerationStep, StoryProfile, StoryFormat, StoryTheme, LiteraryArchetype, NarrativePOV } from '../types';
 import Button from './ui/Button';
@@ -541,6 +542,7 @@ export default function Dashboard({
   const [universeDesc, setUniverseDesc] = useState('');
   const [profile, setProfile] = useState<StoryProfile>(() => ({ ...DEFAULT_PROFILE, lang: lang as 'pt' | 'en' }));
   const [autoGenChapters, setAutoGenChapters] = useState(3);
+  const apiKeysFilled = hasAllApiKeys(loadApiKeys());
 
   // SHOW AUTOGEN PROGRESS OVERLAY
   if (autoGenProgress && autoGenProgress.phase !== 'done') {
@@ -554,7 +556,9 @@ export default function Dashboard({
 
   // ── State 1: Welcome — Choose Your Path ─────────────────────────────────────
   if (!universe) {
-    const canStartManual = universeName.trim().length > 0;
+    // Checa se todas as API keys estão preenchidas
+    // Bloqueia inicialização se qualquer key existir no .env
+    const canStartManual = universeName.trim().length > 0 && apiKeysFilled;
 
     return (
       <div className="flex flex-col items-center justify-center min-h-full py-10 px-4">
@@ -684,6 +688,13 @@ export default function Dashboard({
                 </div>
 
                 <div className="px-6 py-4 bg-stone-50 border-t border-stone-100 flex items-center gap-3">
+                  {!apiKeysFilled && (
+                    <p className="text-xs text-amber-700 font-medium">
+                      {lang === 'pt'
+                        ? 'Este usu&aacute;rio precisa salvar as API Keys no navegador antes de iniciar o engine.'
+                        : 'This user must save API keys in the browser before starting the engine.'}
+                    </p>
+                  )}
                   {/* Import */}
                   <label className="cursor-pointer">
                     <input
@@ -708,7 +719,7 @@ export default function Dashboard({
                     isLoading={isLoading}
                     className="ml-auto bg-stone-900 text-white hover:bg-black"
                   >
-                    {t('dash.arch.cta')}
+                    {apiKeysFilled ? t('dash.arch.cta') : (lang === 'pt' ? 'Salve as API Keys' : 'Save API Keys')}
                     <ArrowRight className="w-4 h-4 ml-2" />
                   </Button>
                 </div>

@@ -11,12 +11,9 @@ export default defineConfig(({ mode }) => {
       },
       plugins: [react()],
       define: {
-        'process.env.GROQ_API_KEY': JSON.stringify(env.GROQ_API_KEY),
         'process.env.GROQ_MODEL': JSON.stringify(env.GROQ_MODEL || 'llama-3.3-70b-versatile'),
-        'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY || ''),
         'process.env.GEMINI_MODEL': JSON.stringify(env.GEMINI_MODEL || 'gemini-2.0-flash'),
         'process.env.GEMINI_FALLBACK_MODEL': JSON.stringify(env.GEMINI_FALLBACK_MODEL || 'gemini-2.0-flash-lite'),
-        'process.env.CEREBRAS_API_KEY': JSON.stringify(env.CEREBRAS_API_KEY || ''),
         'process.env.CEREBRAS_MODEL': JSON.stringify(env.CEREBRAS_MODEL || 'qwen-3-235b-a22b-instruct-2507'),
       },
       resolve: {

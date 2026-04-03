@@ -1,8 +1,10 @@
 
-import React from 'react';
+import React, { useState } from 'react';
 import type { View } from '../types';
 import { ICONS } from '../constants';
 import Tooltip from './ui/Tooltip';
+import ApiKeyModal from './ui/ApiKeyModal';
+import { EMPTY_API_KEYS, loadApiKeys, saveApiKeys } from '../utils/apiKeys';
 import { Globe } from 'lucide-react';
 import { useLanguage } from '../LanguageContext';
 
@@ -55,6 +57,16 @@ export default function Sidebar({ currentView, setCurrentView, universeExists }:
     { view: 'assets', label: t('nav.assets') },
   ];
 
+  // Controle do modal de API Key
+  const [apiModalOpen, setApiModalOpen] = useState(false);
+  const [apiKeys, setApiKeys] = useState(() => loadApiKeys() || EMPTY_API_KEYS);
+
+  const handleSaveKeys = (keys: { groq: string; gemini: string; cerebras: string }) => {
+    saveApiKeys(keys);
+    setApiKeys(keys);
+    setApiModalOpen(false);
+  };
+
   return (
     <nav className="flex flex-col items-center gap-y-6 bg-surface p-4 border-r border-stone-200 shadow-sm z-20">
       <div className="flex items-center justify-center w-12 h-12 mb-4 rounded-full bg-paper border border-nobel/20 text-primary">
@@ -73,6 +85,18 @@ export default function Sidebar({ currentView, setCurrentView, universeExists }:
         ))}
       </div>
 
+      {/* Botão para abrir modal de API Key */}
+      <div className="mt-8">
+        <Tooltip content="Configurar API Keys" position="right">
+          <button
+            onClick={() => setApiModalOpen(true)}
+            className="w-12 h-12 flex items-center justify-center rounded-lg border border-nobel/40 bg-paper hover:bg-nobel/10 transition-all shadow-sm text-nobel"
+          >
+            <span className="font-bold text-lg">🔑</span>
+          </button>
+        </Tooltip>
+      </div>
+
       {/* Language Toggle — bottom of sidebar */}
       <div className="mt-auto mb-14 flex flex-col items-center gap-2">
         <Tooltip content={lang === 'pt' ? 'Switch to English' : 'Mudar para Português'} position="right">
@@ -87,6 +111,14 @@ export default function Sidebar({ currentView, setCurrentView, universeExists }:
           </button>
         </Tooltip>
       </div>
+
+      {/* Modal de API Key */}
+      <ApiKeyModal
+        isOpen={apiModalOpen}
+        onClose={() => setApiModalOpen(false)}
+        onSave={handleSaveKeys}
+        initialKeys={apiKeys}
+      />
     </nav>
   );
 }

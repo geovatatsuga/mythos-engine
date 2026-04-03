@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { loadApiKeys } from '../utils/apiKeys';
 import { z } from "zod";
 import type {
     Universe, Character, Chapter, VisualAsset, UniverseIdea,
@@ -215,10 +216,12 @@ const cleanLanguageLeakage = (text: string, lang?: 'pt' | 'en'): string => {
 
 // ─── Clients ─────────────────────────────────────────────────────────────────
 
+
 const getClient = (): OpenAI => {
-    const apiKey = process.env.GROQ_API_KEY;
+    const keys = loadApiKeys();
+    const apiKey = keys?.groq;
     if (!apiKey) {
-        throw new Error('GROQ_API_KEY is not configured.');
+        throw new Error('Groq API key not found in local browser storage.');
     }
     return new OpenAI({
         apiKey,
@@ -227,8 +230,10 @@ const getClient = (): OpenAI => {
     });
 };
 
+
 const getGeminiClient = (): OpenAI | null => {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const keys = loadApiKeys();
+    const apiKey = keys?.gemini;
     if (!apiKey) return null;
     return new OpenAI({
         apiKey,
@@ -237,8 +242,10 @@ const getGeminiClient = (): OpenAI | null => {
     });
 };
 
+
 const getCerebrasClient = (): OpenAI | null => {
-    const apiKey = process.env.CEREBRAS_API_KEY;
+    const keys = loadApiKeys();
+    const apiKey = keys?.cerebras;
     if (!apiKey) return null;
     return new OpenAI({
         apiKey,

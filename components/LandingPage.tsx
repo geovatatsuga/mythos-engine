@@ -1,7 +1,7 @@
 
 import React, { useState, useMemo, useEffect } from 'react';
 import { motion as _motion, AnimatePresence } from 'framer-motion';
-import { ArrowRight, ChevronDown, BookOpen, Sparkles, Users, Feather, Crown, Scroll, Brain, Scale, Music, GitBranch, ImageIcon, Map, Film, Palette, FileText, Download, Shield, Database } from 'lucide-react';
+import { ArrowRight, ChevronDown, BookOpen, Sparkles, Users, Feather, Crown, Scroll, Brain, Scale, Music, GitBranch, ImageIcon, Map, Film, Palette, FileText, Download, Shield, Database, KeyRound } from 'lucide-react';
 import { useLanguage } from '../LanguageContext';
 
 // Fix: framer-motion 10.x + React 19 className/onClick typing conflict
@@ -10,6 +10,8 @@ const motion = _motion as any;
 
 interface LandingPageProps {
   onStart: () => void;
+  onConfigureApiKeys: () => void;
+  hasApiKeys: boolean;
 }
 
 // --- Components ---
@@ -3378,8 +3380,16 @@ const FeaturesGrid = () => {
 
 // --- Main Page ---
 
-export default function LandingPage({ onStart }: LandingPageProps) {
+export default function LandingPage({ onStart, onConfigureApiKeys, hasApiKeys }: LandingPageProps) {
   const { t, lang, toggleLang } = useLanguage();
+  const handlePrimaryAction = () => {
+    if (hasApiKeys) {
+      onStart();
+      return;
+    }
+    onConfigureApiKeys();
+  };
+
   return (
     <div className="min-h-screen bg-paper font-sans text-stone selection:bg-nobel selection:text-white overflow-x-hidden">
       
@@ -3405,10 +3415,10 @@ export default function LandingPage({ onStart }: LandingPageProps) {
                     {lang === 'pt' ? 'EN' : 'PT'}
                 </button>
                 <button 
-                    onClick={onStart} 
+                    onClick={handlePrimaryAction}
                     className="bg-stone-dark text-white px-6 py-2 text-sm uppercase tracking-widest hover:bg-nobel transition-colors duration-300 shadow-lg shadow-stone-900/20"
                 >
-                    {t('landing.nav.cta')}
+                    {hasApiKeys ? t('landing.nav.cta') : (lang === 'pt' ? 'Salvar API Keys' : 'Save API Keys')}
                 </button>
             </div>
         </div>
@@ -3450,14 +3460,26 @@ export default function LandingPage({ onStart }: LandingPageProps) {
                  initial={{ opacity: 0, y: 20 }}
                  animate={{ opacity: 1, y: 0 }}
                  transition={{ delay: 0.8 }}
+                 className="flex flex-col items-center gap-4"
             >
-                 <button onClick={onStart} className="group relative inline-flex items-center justify-center px-8 py-4 bg-nobel text-white uppercase tracking-widest text-sm font-bold transition-all hover:bg-yellow-600 overflow-hidden rounded-sm shadow-[0_0_20px_rgba(197,160,89,0.4)] hover:shadow-[0_0_40px_rgba(197,160,89,0.6)]">
+                 <button onClick={handlePrimaryAction} className="group relative inline-flex items-center justify-center px-8 py-4 bg-nobel text-white uppercase tracking-widest text-sm font-bold transition-all hover:bg-yellow-600 overflow-hidden rounded-sm shadow-[0_0_20px_rgba(197,160,89,0.4)] hover:shadow-[0_0_40px_rgba(197,160,89,0.6)]">
                     <span className="relative z-10 flex items-center">
-                        {t('landing.hero.cta')}
+                        {hasApiKeys ? t('landing.hero.cta') : (lang === 'pt' ? 'Salvar API Keys para Iniciar' : 'Save API Keys to Start')}
                         <ArrowRight className="w-4 h-4 ml-3 group-hover:translate-x-1 transition-transform" />
                     </span>
                     <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent -translate-x-full group-hover:animate-[shimmer_1.5s_infinite]" />
                  </button>
+                 {!hasApiKeys && (
+                  <button
+                    onClick={onConfigureApiKeys}
+                    className="inline-flex items-center gap-2 text-sm text-stone-300 hover:text-nobel transition-colors"
+                  >
+                    <KeyRound className="w-4 h-4" />
+                    {lang === 'pt'
+                      ? 'As chaves do usu&aacute;rio precisam ser salvas localmente antes de iniciar.'
+                      : 'User API keys must be saved locally before starting.'}
+                  </button>
+                 )}
             </motion.div>
         </div>
 
@@ -3569,7 +3591,7 @@ export default function LandingPage({ onStart }: LandingPageProps) {
               {lang === 'pt' ? 'A sua história está esperando.' : 'Your story is waiting.'}
             </p>
             <button
-              onClick={onStart}
+              onClick={handlePrimaryAction}
               className="group relative inline-flex items-center justify-center px-10 py-5 bg-nobel text-white uppercase tracking-widest text-sm font-bold transition-all hover:bg-yellow-600 rounded-sm shadow-[0_0_28px_rgba(197,160,89,0.35)] hover:shadow-[0_0_52px_rgba(197,160,89,0.6)] overflow-hidden"
             >
               <span className="relative z-10 flex items-center gap-3">

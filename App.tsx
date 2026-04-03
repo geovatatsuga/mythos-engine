@@ -13,12 +13,16 @@ import Toast from './components/ui/Toast';
 
 import LandingPage from './components/LandingPage';
 import AgentThinkingPanel from './components/ui/AgentThinkingPanel';
+import ApiKeyModal from './components/ui/ApiKeyModal';
 import { generateDivineGenesis, createNewUniverse, generateCharacter, generateImage, generateStoryArc } from './services/geminiService';
 import type { AutogenProgress } from './services/geminiService';
 import { createPortraitUrl } from './utils/portraits';
+import { EMPTY_API_KEYS, hasAllApiKeys, loadApiKeys, saveApiKeys } from './utils/apiKeys';
 
 export default function App() {
   const [hasStarted, setHasStarted] = useState(false);
+  const [apiModalOpen, setApiModalOpen] = useState(false);
+  const [apiKeys, setApiKeys] = useState(() => loadApiKeys() || EMPTY_API_KEYS);
   const [currentView, setCurrentView] = useState<View>('dashboard');
   const [universe, setUniverse] = useState<Universe | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -26,6 +30,26 @@ export default function App() {
   const [toast, setToast] = useState<ToastMessage | null>(null);
   const [autoGenProgress, setAutoGenProgress] = useState<AutogenProgress | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const apiKeysReady = hasAllApiKeys(apiKeys);
+
+  useEffect(() => {
+    setApiKeys(loadApiKeys() || EMPTY_API_KEYS);
+  }, []);
+
+  const handleStartRequest = useCallback(() => {
+    if (!apiKeysReady) {
+      setApiModalOpen(true);
+      return;
+    }
+    setHasStarted(true);
+  }, [apiKeysReady]);
+
+  const handleSaveApiKeys = useCallback((keys: typeof EMPTY_API_KEYS) => {
+    saveApiKeys(keys);
+    setApiKeys(keys);
+    setApiModalOpen(false);
+    setHasStarted(true);
+  }, []);
 
 
 
@@ -276,7 +300,19 @@ export default function App() {
   return (
     <LanguageProvider>
       {!hasStarted ? (
-        <LandingPage onStart={() => setHasStarted(true)} />
+        <>
+          <LandingPage
+            onStart={handleStartRequest}
+            onConfigureApiKeys={() => setApiModalOpen(true)}
+            hasApiKeys={apiKeysReady}
+          />
+          <ApiKeyModal
+            isOpen={apiModalOpen}
+            onClose={() => setApiModalOpen(false)}
+            onSave={handleSaveApiKeys}
+            initialKeys={apiKeys}
+          />
+        </>
       ) : (
         <div className="flex h-screen bg-background text-text font-sans">
           <Sidebar currentView={currentView} setCurrentView={setCurrentView} universeExists={!!universe} />
