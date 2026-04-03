@@ -404,7 +404,7 @@ interface DashboardProps {
   autoGenProgress?: AutogenProgress | null;
 }
 
-const AUTOGEN_CHAPTER_OPTIONS = [1, 2, 3, 5, 8];
+const AUTOGEN_CHAPTER_OPTIONS = [2, 3];
 
 const AutogenProgressOverlay: React.FC<{ progress: AutogenProgress; onAbort: () => void }> = ({ progress, onAbort }) => {
     const { lang } = useLanguage();
