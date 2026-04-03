@@ -332,7 +332,7 @@ const translations = {
     'landing.hero.badge': 'Forja de Mundos & Narrativas',
     'landing.hero.title': 'Construa Universos',
     'landing.hero.titleAccent': 'Infinitos',
-    'landing.hero.desc': 'Cinco agentes especializados descem ao caos da sua premissa e retornam com um mundo estruturado, um protagonista de alma talhada em pedra, e o primeiro capítulo da sua épica.',
+    'landing.hero.desc': 'Oito agentes especializados descem ao caos da sua premissa e retornam com um mundo estruturado, um protagonista de alma talhada em pedra, e o primeiro capítulo da sua épica.',
     'landing.hero.cta': 'Começar a Criar',
     // Landing page — Manifesto
     'landing.manifesto.quote': '"Criar um mundo é um ato de divindade, mas mantê-lo é um ato de administração."',
@@ -379,13 +379,13 @@ const translations = {
     'landing.how.step1.title': 'A Premissa',
     'landing.how.step1.desc': 'Escreva uma frase. Pode ser vaga. O Arquiteto expande o universo e o Forjador de Almas cria o protagonista com Ghost, Lie e motivações reais.',
     'landing.how.step2.title': 'O Pipeline',
-    'landing.how.step2.desc': 'Cinco agentes especializados agem em sequência — mundo, herói, beats narrativos, prosa e extração de fatos para o Codex.',
+    'landing.how.step2.desc': 'Oito agentes especializados agem em sequência — mundo, herói, beats narrativos, prosa e extração de fatos para o Codex.',
     'landing.how.step3.title': 'O Resultado',
     'landing.how.step3.desc': 'Um Capítulo 1 completo, um Codex populado com facções e regras do mundo, e um protagonista com psicologia profunda — pronto para evoluir.',
     // Landing page — Pipeline
     'landing.pipeline.badge': 'Os Agentes em Ação',
     'landing.pipeline.title': 'O Pipeline ao Vivo',
-    'landing.pipeline.desc': 'Cinco agentes especializados. Cada um com uma função, em sequência — do universo ao Codex.',
+    'landing.pipeline.desc': 'Oito agentes especializados. Cada um com uma função, em sequência — do universo ao Codex.',
     // Landing page — Features Grid
     'landing.features.badge': 'O Que Você Recebe',
     'landing.features.title': 'Tudo Que o Motor Entrega',
@@ -738,7 +738,7 @@ const translations = {
     'landing.hero.badge': 'World Forge & Narrative Engine',
     'landing.hero.title': 'Build Infinite',
     'landing.hero.titleAccent': 'Universes',
-    'landing.hero.desc': 'Five specialized agents descend into the chaos of your premise and return with a structured world, a protagonist with a soul carved in stone, and the first chapter of your epic.',
+    'landing.hero.desc': 'Eight specialized agents descend into the chaos of your premise and return with a structured world, a protagonist with a soul carved in stone, and the first chapter of your epic.',
     'landing.hero.cta': 'Start Creating',
     // Landing page — Manifesto
     'landing.manifesto.quote': '"Creating a world is an act of godhood, but maintaining it is an act of administration."',
@@ -785,13 +785,13 @@ const translations = {
     'landing.how.step1.title': 'The Premise',
     'landing.how.step1.desc': 'Write a sentence. Vague is fine. The Architect expands the world and the Soulforger creates the protagonist with Ghost, Lie, and real motivations.',
     'landing.how.step2.title': 'The Pipeline',
-    'landing.how.step2.desc': 'Five specialized agents act in sequence — world, hero, narrative beats, prose and Codex extraction.',
+    'landing.how.step2.desc': 'Eight specialized agents act in sequence — world, hero, narrative beats, prose and Codex extraction.',
     'landing.how.step3.title': 'The Result',
     'landing.how.step3.desc': 'A complete Chapter 1, a Codex populated with factions and world rules, and a protagonist with deep psychology — ready to evolve.',
     // Landing page — Pipeline
     'landing.pipeline.badge': 'Live Agent Pipeline',
     'landing.pipeline.title': 'The Pipeline in Action',
-    'landing.pipeline.desc': 'Five specialized agents. Each with one function, in strict sequence — from universe to Codex.',
+    'landing.pipeline.desc': 'Eight specialized agents. Each with one function, in strict sequence — from universe to Codex.',
     // Landing page — Features Grid
     'landing.features.badge': 'What You Get',
     'landing.features.title': 'Everything the Engine Delivers',
