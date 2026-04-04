@@ -4,6 +4,7 @@ import type { Universe, AgentConfig } from '../types';
 import { DEFAULT_AGENTS } from '../constants';
 import Button from './ui/Button';
 import Card from './ui/Card';
+import InlineHelp from './ui/InlineHelp';
 import { Crown, Scroll, GitBranch, Users, Scale, Music, Save, RotateCcw, CircuitBoard } from 'lucide-react';
 import { useLanguage } from '../LanguageContext';
 
@@ -176,6 +177,7 @@ export default function AgentsView({ universe, onUpdateUniverse }: AgentsViewPro
                     <label className="block text-xs font-bold uppercase tracking-widest text-stone-400 mb-2 flex items-center">
                         <CircuitBoard className="w-4 h-4 mr-2" />
                         {t('agents.systemInstruction')}
+                        <span className="ml-2"><InlineHelp content={t('help.agents.systemInstruction')} /></span>
                     </label>
                     <div className="relative flex-grow">
                         <textarea 

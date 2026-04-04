@@ -4,7 +4,8 @@ import type { Universe, Chapter, ChapterGenerationParams, ArbiterIssue, WeaverPl
 import Button from './ui/Button';
 import Card from './ui/Card';
 import Modal from './ui/Modal';
-import { Plus, Edit, FileText, Sparkles, BookOpen, Microchip, UserCheck, Search, Save, GitBranch, Eye, RefreshCw, Layers, ArrowLeft, CheckCircle2, Globe } from 'lucide-react';
+import InlineHelp from './ui/InlineHelp';
+import { Plus, Edit, FileText, Sparkles, BookOpen, Microchip, UserCheck, Search, Save, Eye, RefreshCw, ArrowLeft, CheckCircle2, Globe } from 'lucide-react';
 import { generateChapterWithAgents, suggestNextChapterPlot, reviewChapterWithArbiter, rewriteChapterBySuggestions, generateWeaverPlans } from '../services/geminiService';
 import Toast from './ui/Toast';
 import { MeanderDivider } from './ui/MeanderDivider';
@@ -24,13 +25,18 @@ const ChapterListItem: React.FC<{ chapter: Chapter; onSelect: () => void, isSele
         'Revisado': 'bg-blue-500',
         'Aprovado': 'bg-green-500'
     };
+    const chapterTitle = typeof chapter.title === 'string' && chapter.title.trim().length > 0
+        ? chapter.title
+        : 'Capítulo sem título';
+    const chapterSummary = typeof chapter.summary === 'string' ? chapter.summary : '';
+    const chapterStatus = chapter.status in statusColors ? chapter.status : 'Rascunho';
     return (
     <div onClick={onSelect} className={`p-4 rounded-lg cursor-pointer transition-colors duration-200 ${isSelected ? 'bg-nobel/10 border-l-4 border-nobel' : 'hover:bg-surface hover:shadow-sm'}`}>
         <div className="flex justify-between items-center">
-            <h4 className="font-serif font-semibold text-stone-dark">{chapter.title}</h4>
-            <span className={`px-2 py-1 text-[10px] uppercase tracking-wider text-white rounded-full ${statusColors[chapter.status]}`}>{t(`status.${chapter.status}`)}</span>
+            <h4 className="font-serif font-semibold text-stone-dark">{chapterTitle}</h4>
+            <span className={`px-2 py-1 text-[10px] uppercase tracking-wider text-white rounded-full ${statusColors[chapterStatus]}`}>{t(`status.${chapterStatus}`)}</span>
         </div>
-        <p className="text-sm text-text-secondary mt-1 truncate font-sans">{chapter.summary}</p>
+        <p className="text-sm text-text-secondary mt-1 truncate font-sans">{chapterSummary}</p>
     </div>
     );
 };
@@ -47,13 +53,19 @@ const TextEditor: React.FC<{
     const [isEditMode, setIsEditMode] = useState(false);
     const [content, setContent] = useState('');
     const [showIssues, setShowIssues] = useState(false);
+    const chapterTitle = typeof chapter?.title === 'string' && chapter.title.trim().length > 0
+        ? chapter.title
+        : 'Capítulo sem título';
+    const chapterContent = typeof chapter?.content === 'string' ? chapter.content : '';
 
     useEffect(() => {
         if (chapter) {
-            setContent(chapter.content);
+            setContent(chapterContent);
             setIsEditMode(false);
+        } else {
+            setContent('');
         }
-    }, [chapter]);
+    }, [chapter, chapterContent]);
 
     if (!chapter) {
         return (
@@ -197,7 +209,7 @@ const TextEditor: React.FC<{
                         />
                      ) : (
                         <div className="p-8 md:p-12 max-w-3xl mx-auto">
-                            <h1 className="text-4xl font-serif font-bold text-center mb-12 text-stone-dark">{chapter.title.replace(/^#+\s*/, '')}</h1>
+                            <h1 className="text-4xl font-serif font-bold text-center mb-12 text-stone-dark">{chapterTitle.replace(/^#+\s*/, '')}</h1>
                             <div className="font-serif text-stone-800">
                                 {renderedParagraphs}
                             </div>
@@ -209,6 +221,7 @@ const TextEditor: React.FC<{
                 <Card className="p-4 bg-stone-50 border-stone-200">
                     <h4 className="font-bold text-xs uppercase tracking-widest mb-3 flex items-center text-primary">
                         <Sparkles className="h-4 w-4 mr-2"/>{t('chapters.aiEditor')}
+                        <span className="ml-2"><InlineHelp content={t('help.chapters.arbiter')} /></span>
                     </h4>
                     <div className="space-y-2 mb-4">
                         {aiSuggestions.map(sugg => (
@@ -313,6 +326,76 @@ const TextEditor: React.FC<{
     );
 };
 
+const LoomSigil: React.FC<{ className?: string }> = ({ className }) => (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M6 4v16" />
+        <path d="M18 4v16" />
+        <path d="M6 8h12" />
+        <path d="M6 16h12" />
+        <path d="M9 8v8" />
+        <path d="M12 8v8" />
+        <path d="M15 8v8" />
+    </svg>
+);
+
+const DirectorSigil: React.FC<{ className?: string }> = ({ className }) => (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="12" cy="12" r="7" />
+        <path d="M12 3v4" />
+        <path d="M12 17v4" />
+        <path d="M3 12h4" />
+        <path d="M17 12h4" />
+        <path d="M9.5 14.5 15 9" />
+        <path d="m15 9-1 4-4 1" />
+    </svg>
+);
+
+const BardSeal: React.FC<{ className?: string }> = ({ className }) => (
+    <div className={`inline-flex items-center justify-center rounded-full ${className || ''}`}>
+        <FeatherIcon className="w-full h-full" />
+    </div>
+);
+
+const sanitizeToneValue = (value: string): ChapterGenerationParams['tone'] => {
+    const normalized = value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    if (normalized.includes('epic') || normalized.includes('pico')) return '\u00C9pico';
+    if (normalized.includes('mister')) return 'Misterioso';
+    if (normalized.includes('dramat')) return 'Dram\u00E1tico';
+    if (normalized.includes('humor')) return 'Humor\u00EDstico';
+    if (normalized.includes('liric') || normalized.includes('lirico')) return 'L\u00EDrico';
+    return 'Sombrio';
+};
+
+const sanitizeFocusValue = (value: string): ChapterGenerationParams['focus'] => {
+    const normalized = value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    if (normalized.includes('dialog')) return 'Di\u00E1logo';
+    if (normalized.includes('lore')) return 'Lore';
+    if (normalized.includes('introspec')) return 'Introspec\u00E7\u00E3o';
+    return 'A\u00E7\u00E3o';
+};
+
+const getToneLabel = (value: ChapterGenerationParams['tone'], lang: 'pt' | 'en') => {
+    const labels: Record<ChapterGenerationParams['tone'], { pt: string; en: string }> = {
+        Sombrio: { pt: 'Sombrio', en: 'Dark' },
+        '\u00C9pico': { pt: 'Épico', en: 'Epic' },
+        Misterioso: { pt: 'Misterioso', en: 'Mysterious' },
+        'Dram\u00E1tico': { pt: 'Dramático', en: 'Dramatic' },
+        'Humor\u00EDstico': { pt: 'Humorístico', en: 'Humorous' },
+        'L\u00EDrico': { pt: 'Lírico', en: 'Lyrical' },
+    };
+    return labels[value][lang];
+};
+
+const getFocusLabel = (value: ChapterGenerationParams['focus'], lang: 'pt' | 'en') => {
+    const labels: Record<ChapterGenerationParams['focus'], { pt: string; en: string }> = {
+        'A\u00E7\u00E3o': { pt: 'Ação', en: 'Action' },
+        'Di\u00E1logo': { pt: 'Diálogo', en: 'Dialogue' },
+        Lore: { pt: 'Lore', en: 'Lore' },
+        'Introspec\u00E7\u00E3o': { pt: 'Introspecção', en: 'Introspection' },
+    };
+    return labels[value][lang];
+};
+
 // --- New Modal for Agent Configuration ---
 
 const NarrativeLabModal: React.FC<{
@@ -339,6 +422,32 @@ const NarrativeLabModal: React.FC<{
     const [selectedPlanIdx, setSelectedPlanIdx] = useState<number | null>(null);
     const [isGeneratingPlans, setIsGeneratingPlans] = useState(false);
     const [planError, setPlanError] = useState<string | null>(null);
+    const toneOptions: Array<{ value: ChapterGenerationParams['tone']; sigil: string; accent: string; description: { pt: string; en: string } }> = [
+        { value: 'Sombrio', sigil: 'S', accent: 'from-stone-900 via-stone-800 to-stone-700', description: { pt: 'Peso, perda e consequência sem consolo fácil.', en: 'Weight, loss, and consequence without easy relief.' } },
+        { value: 'Ã‰pico', sigil: 'E', accent: 'from-amber-700 via-yellow-600 to-amber-500', description: { pt: 'Escala mítica, destino e feitos dignos de crônica.', en: 'Mythic scale, fate, and deeds worthy of legend.' } },
+        { value: 'Misterioso', sigil: 'M', accent: 'from-sky-900 via-slate-800 to-indigo-700', description: { pt: 'Véus, suspeitas e revelações mantidas na sombra.', en: 'Veils, suspicion, and revelations kept in shadow.' } },
+        { value: 'DramÃ¡tico', sigil: 'D', accent: 'from-rose-800 via-red-700 to-amber-600', description: { pt: 'Ruptura emocional, confronto e custo íntimo.', en: 'Emotional rupture, confrontation, and intimate cost.' } },
+        { value: 'HumorÃ­stico', sigil: 'H', accent: 'from-emerald-700 via-teal-600 to-cyan-500', description: { pt: 'Leveza afiada, ironia e fôlego entre golpes.', en: 'Sharp levity, irony, and breathing room between blows.' } },
+        { value: 'LÃ­rico', sigil: 'L', accent: 'from-violet-700 via-fuchsia-600 to-rose-500', description: { pt: 'Cadência poética e imagem sensorial mais rica.', en: 'Poetic cadence and richer sensory imagery.' } },
+    ];
+    const focusOptions: Array<{ value: ChapterGenerationParams['focus']; sigil: string; accent: string; description: { pt: string; en: string } }> = [
+        { value: 'AÃ§Ã£o', sigil: 'I', accent: 'from-stone-900 via-amber-700 to-red-700', description: { pt: 'Choque, deslocamento e decisão física no centro da cena.', en: 'Collision, movement, and physical decisions at the center of the scene.' } },
+        { value: 'DiÃ¡logo', sigil: 'II', accent: 'from-stone-900 via-stone-700 to-amber-500', description: { pt: 'Vozes em atrito, subtexto e alianças testadas.', en: 'Voices in friction, subtext, and alliances under strain.' } },
+        { value: 'Lore', sigil: 'III', accent: 'from-stone-900 via-blue-800 to-teal-600', description: { pt: 'Segredos do mundo, instituições e memória antiga.', en: 'World secrets, institutions, and ancient memory.' } },
+        { value: 'IntrospecÃ§Ã£o', sigil: 'IV', accent: 'from-stone-900 via-indigo-800 to-violet-600', description: { pt: 'Pressão interior, desejo, culpa e contradição.', en: 'Inner pressure, desire, guilt, and contradiction.' } },
+    ];
+    const normalizedToneOptions = toneOptions.map(option => ({ ...option, value: sanitizeToneValue(option.value) }));
+    const normalizedFocusOptions = focusOptions.map(option => ({ ...option, value: sanitizeFocusValue(option.value) }));
+    const selectedTone = normalizedToneOptions.find(option => option.value === sanitizeToneValue(params.tone)) ?? normalizedToneOptions[3];
+    const selectedFocus = normalizedFocusOptions.find(option => option.value === sanitizeFocusValue(params.focus)) ?? normalizedFocusOptions[0];
+
+    useEffect(() => {
+        setParams(prev => ({
+            ...prev,
+            tone: sanitizeToneValue(prev.tone),
+            focus: sanitizeFocusValue(prev.focus),
+        }));
+    }, []);
 
     const toggleCharacter = (id: string) => {
         setParams(prev => ({
@@ -417,14 +526,52 @@ const NarrativeLabModal: React.FC<{
         <>
         <Modal isOpen={isOpen} onClose={onClose} title={t('chapters.modal.title')}>
             <div className="space-y-6">
-                <div className="bg-primary/5 p-4 rounded-lg border border-primary/20 flex justify-between items-center">
-                    <p className="text-sm text-stone-600 flex items-center">
-                        <Microchip className="w-4 h-4 mr-2 text-primary" />
-                        {t('chapters.modal.auto')}
-                    </p>
-                    <Button variant="secondary" size="sm" onClick={handleAutoSuggest} isLoading={isSuggesting}>
-                        <GitBranch className="w-3 h-3 mr-2" /> {t('chapters.modal.autoCta')}
-                    </Button>
+                <div className="relative overflow-hidden rounded-2xl border border-amber-200/60 bg-gradient-to-br from-stone-950 via-stone-900 to-amber-950 p-5 text-stone-100 shadow-xl">
+                    <div className="absolute inset-0 opacity-20 bg-[radial-gradient(circle_at_top_left,_rgba(245,158,11,0.35),_transparent_40%),radial-gradient(circle_at_bottom_right,_rgba(251,191,36,0.18),_transparent_35%)]" />
+                    <div className="relative flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                        <div className="space-y-3">
+                            <div className="inline-flex items-center gap-2 rounded-full border border-amber-300/20 bg-white/5 px-3 py-1 text-[11px] font-bold uppercase tracking-[0.26em] text-amber-200">
+                                <LoomSigil className="h-3.5 w-3.5" />
+                                {lang === 'en' ? 'Weaver Chamber' : 'Câmara do Tecelão'}
+                            </div>
+                            <div>
+                                <p className="font-serif text-xl text-amber-50">
+                                    {lang === 'en'
+                                        ? 'The Director judges the rhythm. The Weaver spins the plot. The Bard sings the prose.'
+                                        : 'O Director julga o ritmo. O Tecelão fia o enredo. O Bardo canta a prosa.'}
+                                </p>
+                                <p className="mt-2 text-sm leading-relaxed text-stone-300">{t('chapters.modal.auto')}</p>
+                            </div>
+                            <div className="flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.2em] text-stone-300">
+                                <span className="inline-flex items-center gap-2 rounded-full border border-stone-500/60 bg-stone-900/40 px-3 py-1">
+                                    <DirectorSigil className="h-3.5 w-3.5 text-amber-300" />
+                                    Director
+                                </span>
+                                <span className="inline-flex items-center gap-2 rounded-full border border-stone-500/60 bg-stone-900/40 px-3 py-1">
+                                    <LoomSigil className="h-3.5 w-3.5 text-amber-300" />
+                                    Weaver
+                                </span>
+                                <span className="inline-flex items-center gap-2 rounded-full border border-stone-500/60 bg-stone-900/40 px-3 py-1">
+                                    <BardSeal className="h-3.5 w-3.5 text-amber-300" />
+                                    Bard
+                                </span>
+                            </div>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={handleAutoSuggest}
+                            disabled={isSuggesting}
+                            className="group inline-flex items-center justify-center gap-3 self-start rounded-2xl border border-amber-300/30 bg-amber-100 px-5 py-3 text-left text-stone-900 shadow-lg shadow-black/30 transition-all hover:-translate-y-0.5 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-70"
+                        >
+                            <LoomSigil className="h-5 w-5 text-amber-700 transition-transform group-hover:rotate-6" />
+                            <span className="flex flex-col">
+                                <span className="text-[11px] font-bold uppercase tracking-[0.24em] text-amber-700/80">
+                                    {lang === 'en' ? 'Invoke the Weaver' : 'Invocar o Tecelão'}
+                                </span>
+                                <span className="text-sm font-semibold">{isSuggesting ? (lang === 'en' ? 'Weaving plot...' : 'Tecendo enredo...') : t('chapters.modal.autoCta')}</span>
+                            </span>
+                        </button>
+                    </div>
                 </div>
                 {suggestError && (
                     <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded px-3 py-2">
@@ -433,12 +580,12 @@ const NarrativeLabModal: React.FC<{
                 )}
 
                 {/* Chapter Position Selector */}
-                <div>
+                <div className="rounded-2xl border border-stone-200 bg-stone-50/80 p-4">
                     <label className="block text-xs font-bold uppercase tracking-widest text-stone-500 mb-1">
                         {t('chapters.chapterPosition')}
                     </label>
                     <select
-                        className="w-full p-2 bg-white border border-stone-300 rounded focus:ring-2 focus:ring-primary focus:outline-none"
+                        className="w-full rounded-xl border border-stone-300 bg-white px-3 py-3 text-stone-800 shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/40"
                         value={chapterPosition === 'end' ? 'end' : String(chapterPosition)}
                         onChange={e => setChapterPosition(e.target.value === 'end' ? 'end' : Number(e.target.value))}
                     >
@@ -453,67 +600,105 @@ const NarrativeLabModal: React.FC<{
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                     {/* Left Column: Setup */}
-                    <div className="space-y-4">
-                        <div>
+                    <div className="space-y-5">
+                        <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
                             <label className="block text-xs font-bold uppercase tracking-widest text-stone-500 mb-1">{t('chapters.modal.chTitle')}</label>
                             <input 
                                 type="text" 
-                                className="w-full p-2 bg-white border border-stone-300 rounded focus:ring-2 focus:ring-primary focus:outline-none"
+                                className="w-full rounded-xl border border-stone-300 bg-stone-50 px-3 py-3 text-stone-800 focus:outline-none focus:ring-2 focus:ring-primary/40"
                                 placeholder={t('chapters.modal.chPlaceholder')}
                                 value={params.title}
                                 onChange={e => setParams({...params, title: e.target.value})}
                             />
                         </div>
-                        <div>
+                        <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
                             <label className="block text-xs font-bold uppercase tracking-widest text-stone-500 mb-1">{t('chapters.modal.plot')}</label>
                             <textarea 
-                                className="w-full p-2 bg-white border border-stone-300 rounded focus:ring-2 focus:ring-primary focus:outline-none h-24 resize-none"
+                                className="h-32 w-full resize-none rounded-xl border border-stone-300 bg-stone-50 px-3 py-3 text-stone-800 focus:outline-none focus:ring-2 focus:ring-primary/40"
                                 placeholder={t('chapters.modal.plotPlaceholder')}
                                 value={params.plotDirection}
                                 onChange={e => setParams({...params, plotDirection: e.target.value})}
                             />
                         </div>
-                         <div className="grid grid-cols-2 gap-4">
+                         <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
+                            <div className="grid grid-cols-2 gap-4">
                             <div>
-                                <label className="block text-xs font-bold uppercase tracking-widest text-stone-500 mb-1">{t('chapters.modal.tone')}</label>
+                                <label className="mb-1 flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-stone-500">
+                                    <span>{t('chapters.modal.tone')}</span>
+                                    <InlineHelp content={t('help.chapters.tone')} />
+                                </label>
                                 <select 
-                                    className="w-full p-2 bg-white border border-stone-300 rounded"
+                                    className="w-full rounded-xl border border-stone-300 bg-stone-50 px-3 py-3 text-stone-800 focus:outline-none focus:ring-2 focus:ring-primary/40"
                                     value={params.tone}
                                     onChange={e => setParams({...params, tone: e.target.value as any})}
                                 >
-                                    {['Sombrio', 'Épico', 'Misterioso', 'Dramático', 'Humorístico'].map(tn => <option key={tn} value={tn}>{t(`tone.${tn}`)}</option>)}
+                                    {TONE_VALUES.map(tn => <option key={tn} value={tn}>{getToneLabel(tn, lang)}</option>)}
                                 </select>
                             </div>
                             <div>
-                                <label className="block text-xs font-bold uppercase tracking-widest text-stone-500 mb-1">{t('chapters.modal.focus')}</label>
+                                <label className="mb-1 flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-stone-500">
+                                    <span>{t('chapters.modal.focus')}</span>
+                                    <InlineHelp content={t('help.chapters.focus')} />
+                                </label>
                                 <select 
-                                    className="w-full p-2 bg-white border border-stone-300 rounded"
+                                    className="w-full rounded-xl border border-stone-300 bg-stone-50 px-3 py-3 text-stone-800 focus:outline-none focus:ring-2 focus:ring-primary/40"
                                     value={params.focus}
                                     onChange={e => setParams({...params, focus: e.target.value as any})}
                                 >
-                                    {['Ação', 'Diálogo', 'Lore', 'Introspecção'].map(fc => <option key={fc} value={fc}>{t(`focus.${fc}`)}</option>)}
+                                    {FOCUS_VALUES.map(fc => <option key={fc} value={fc}>{getFocusLabel(fc, lang)}</option>)}
                                 </select>
+                            </div>
+                            </div>
+                            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2">
+                                <div className="relative min-h-[120px] overflow-hidden rounded-2xl border border-amber-300 bg-white p-3 shadow-sm shadow-amber-100">
+                                    <div className={`absolute inset-x-0 top-0 h-1.5 bg-gradient-to-r ${selectedTone.accent}`} />
+                                    <div className="flex items-start gap-3">
+                                        <div className="mt-0.5 flex h-10 w-10 min-w-10 items-center justify-center rounded-full border border-amber-200 bg-amber-50 font-serif text-sm text-amber-700">
+                                            {selectedTone.sigil}
+                                        </div>
+                                        <div className="min-w-0">
+                                            <p className="font-serif text-base leading-tight text-stone-900">{getToneLabel(selectedTone.value, lang)}</p>
+                                            <p className="mt-1 text-xs leading-relaxed text-stone-500">{selectedTone.description[lang]}</p>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="relative min-h-[120px] overflow-hidden rounded-2xl border border-stone-900 bg-white p-3 shadow-sm shadow-stone-200">
+                                    <div className={`absolute inset-x-0 top-0 h-1.5 bg-gradient-to-r ${selectedFocus.accent}`} />
+                                    <div className="flex items-start gap-3">
+                                        <div className="mt-0.5 flex h-10 min-w-10 items-center justify-center rounded-full border border-stone-300 bg-stone-900 px-2 font-serif text-xs text-amber-100">
+                                            {selectedFocus.sigil}
+                                        </div>
+                                        <div className="min-w-0">
+                                            <p className="font-serif text-base leading-tight text-stone-900">{getFocusLabel(selectedFocus.value, lang)}</p>
+                                            <p className="mt-1 text-xs leading-relaxed text-stone-500">{selectedFocus.description[lang]}</p>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>
 
                     {/* Right Column: Characters */}
-                    <div>
-                         <label className="block text-xs font-bold uppercase tracking-widest text-stone-500 mb-2">{t('chapters.modal.chars')}</label>
-                         <div className="border border-stone-200 rounded-lg max-h-64 overflow-y-auto bg-stone-50 p-2 space-y-2">
+                    <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
+                         <label className="mb-2 flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-stone-500">
+                            <span>{t('chapters.modal.chars')}</span>
+                            <InlineHelp content={t('help.chapters.activeCharacters')} />
+                         </label>
+                         <div className="border border-stone-200 rounded-2xl max-h-64 overflow-y-auto bg-stone-50/80 p-2 space-y-2">
                             {universe.characters.length === 0 && <p className="text-xs text-stone-400 p-2">{t('chapters.modal.noChars')}</p>}
                             {universe.characters.map(char => (
                                 <div 
                                     key={char.id}
                                     onClick={() => toggleCharacter(char.id)}
-                                    className={`p-2 rounded cursor-pointer flex items-center border transition-all ${params.activeCharacterIds.includes(char.id) ? 'bg-white border-primary shadow-md' : 'bg-transparent border-transparent hover:bg-stone-200'}`}
+                                    className={`p-3 rounded-xl cursor-pointer flex items-center border transition-all ${params.activeCharacterIds.includes(char.id) ? 'bg-white border-amber-300 shadow-sm' : 'bg-transparent border-transparent hover:bg-white hover:border-stone-300'}`}
                                 >
-                                    <div className={`w-4 h-4 rounded-full border flex items-center justify-center mr-3 ${params.activeCharacterIds.includes(char.id) ? 'bg-primary border-primary' : 'border-stone-400'}`}>
+                                    <div className={`w-4 h-4 rounded-full border flex items-center justify-center mr-3 ${params.activeCharacterIds.includes(char.id) ? 'bg-amber-500 border-amber-500' : 'border-stone-400 bg-white'}`}>
                                         {params.activeCharacterIds.includes(char.id) && <UserCheck className="w-3 h-3 text-white" />}
                                     </div>
                                     <div>
                                         <div className="font-semibold text-sm text-stone-800">{char.name}</div>
-                                        <div className="text-xs text-stone-500">{char.role}</div>
+                                        <div className="text-xs uppercase tracking-[0.16em] text-stone-400">{char.role}</div>
+                                        {char.faction && <div className="mt-1 text-xs text-stone-500">{char.faction}</div>}
                                     </div>
                                 </div>
                             ))}
@@ -522,14 +707,20 @@ const NarrativeLabModal: React.FC<{
                 </div>
 
                 <div className="flex justify-between items-center pt-4 border-t border-stone-200 gap-3">
-                    <Button variant="ghost" size="sm" onClick={handleSubmit} isLoading={isLoading} disabled={!params.title || !params.plotDirection} className="text-stone-500">
-                        <Sparkles className="mr-2 h-4 w-4" />
-                        {t('chapters.writeDirect')}
-                    </Button>
-                    <Button onClick={handleGeneratePlans} isLoading={isGeneratingPlans} disabled={isLoading || !params.title || !params.plotDirection}>
-                        <Layers className="mr-2 h-4 w-4" />
-                        {t('chapters.generate3Plans')}
-                    </Button>
+                    <div className="flex items-center gap-2">
+                        <Button variant="ghost" size="sm" onClick={handleSubmit} isLoading={isLoading} disabled={!params.title || !params.plotDirection} className="rounded-xl border border-stone-300 bg-stone-50 px-4 py-3 text-stone-700 hover:border-stone-500 hover:bg-white">
+                            <BardSeal className="mr-2 h-4 w-4 text-primary" />
+                            {t('chapters.writeDirect')}
+                        </Button>
+                        <InlineHelp content={t('help.chapters.writeDirect')} />
+                    </div>
+                    <div className="flex items-center gap-2">
+                        <Button onClick={handleGeneratePlans} isLoading={isGeneratingPlans} disabled={isLoading || !params.title || !params.plotDirection} className="rounded-xl bg-stone-900 px-4 py-3 text-amber-50 hover:bg-black">
+                            <LoomSigil className="mr-2 h-4 w-4 text-amber-300" />
+                            {t('chapters.generate3Plans')}
+                        </Button>
+                        <InlineHelp content={t('help.chapters.generatePlans')} />
+                    </div>
                 </div>
                 {planError && (
                     <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded px-3 py-2 mt-2">
@@ -609,8 +800,9 @@ const NarrativeLabModal: React.FC<{
                         onClick={handleWriteWithPlan}
                         isLoading={isLoading}
                         disabled={selectedPlanIdx === null}
+                        className="rounded-xl bg-stone-900 px-4 py-3 text-amber-50 hover:bg-black"
                     >
-                        <Sparkles className="mr-2 h-4 w-4" />
+                        <BardSeal className="mr-2 h-4 w-4 text-amber-300" />
                         {t('chapters.writeWithPlan')}
                     </Button>
                 </div>
@@ -642,6 +834,17 @@ export default function ChaptersView({ universe, onGenerateChapter: _legacyGener
     useEffect(() => {
         setReviewIssues([]);
     }, [selectedChapter?.id]);
+
+    useEffect(() => {
+        if (!selectedChapter && universe.chapters.length > 0) {
+            setSelectedChapter(universe.chapters[universe.chapters.length - 1]);
+            return;
+        }
+
+        if (selectedChapter && !universe.chapters.some(chapter => chapter.id === selectedChapter.id)) {
+            setSelectedChapter(universe.chapters[universe.chapters.length - 1] ?? null);
+        }
+    }, [universe.chapters, selectedChapter]);
 
     const handleAgentGeneration = async (params: ChapterGenerationParams) => {
         setLocalLoading(true);

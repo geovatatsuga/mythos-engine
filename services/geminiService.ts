@@ -6,7 +6,7 @@ import type {
     ChapterGenerationParams, CodexEntry, StoryProfile, StoryFormat,
     NarrativeMemory, CharacterState, OpenLoop, OpeningStyle, ArbiterIssue,
     TokenUsageEvent, AgentOutputEvent, AgentOutputStatus, WeaverPlan, GenerationQualityMode,
-    DirectorGuidance,
+    DirectorGuidance, AIVisibility, DirtyScope, SyncMeta, TrackingConfig, TruthBundle, CharacterLieState, TimelineEventState, TimelineDiscoveryKind,
 } from '../types';
 import { DEFAULT_AGENTS } from '../constants';
 import { createPortraitUrl } from '../utils/portraits';
@@ -69,9 +69,211 @@ const CEREBRAS_BASE_URL = 'https://api.cerebras.ai/v1';
 const CEREBRAS_DEFAULT_MODEL = process.env.CEREBRAS_MODEL || 'qwen-3-235b-a22b-instruct-2507';
 const CEREBRAS_LAST_RESORT = 'llama3.1-8b'; // absolute last fallback (free tier 8B)
 const CEREBRAS_GPT_OSS_MODELS = new Set(['gpt-oss-120b', 'gpt-oss-20b']);
+const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
+const OPENROUTER_DEFAULT_MODEL = process.env.OPENROUTER_MODEL || 'qwen/qwen3.6-plus:free';
 
 const generateId = () => Math.random().toString(36).substr(2, 9);
 const isEconomyMode = (mode?: GenerationQualityMode): boolean => mode === 'economy';
+
+const DEFAULT_AI_VISIBILITY: AIVisibility = 'tracked';
+const DEFAULT_TRACKING: TrackingConfig = {
+    trackByAlias: true,
+    caseSensitive: false,
+    exclusions: [],
+};
+
+const createTruthBundle = (
+    eventKey: string,
+    statement: string,
+    sourceChapterId?: string,
+    sourceExcerpt?: string,
+): TruthBundle => ({
+    eventKey,
+    needsReview: false,
+    layers: statement.trim()
+        ? [{
+            kind: 'CANON',
+            statement: statement.trim(),
+            sourceChapterId,
+            sourceExcerpt: truncateText(sourceExcerpt, 180),
+            confidence: sourceChapterId ? 0.82 : 1,
+        }]
+        : [],
+});
+
+const createLayeredTruthBundle = (
+    eventKey: string,
+    canon: string,
+    options?: {
+        belief?: string;
+        myth?: string;
+        sourceChapterId?: string;
+        sourceExcerpt?: string;
+    },
+): TruthBundle => {
+    const layers = [
+        canon.trim() ? {
+            kind: 'CANON' as const,
+            statement: canon.trim(),
+            sourceChapterId: options?.sourceChapterId,
+            sourceExcerpt: truncateText(options?.sourceExcerpt, 180),
+            confidence: options?.sourceChapterId ? 0.82 : 1,
+        } : null,
+        options?.belief?.trim() ? {
+            kind: 'BELIEF' as const,
+            statement: options.belief.trim(),
+            sourceChapterId: options?.sourceChapterId,
+            sourceExcerpt: truncateText(options?.sourceExcerpt, 180),
+            confidence: options?.sourceChapterId ? 0.68 : 0.74,
+        } : null,
+        options?.myth?.trim() ? {
+            kind: 'MYTH' as const,
+            statement: options.myth.trim(),
+            sourceChapterId: options?.sourceChapterId,
+            sourceExcerpt: truncateText(options?.sourceExcerpt, 180),
+            confidence: options?.sourceChapterId ? 0.64 : 0.7,
+        } : null,
+    ].filter(Boolean) as TruthBundle['layers'];
+
+    return {
+        eventKey,
+        needsReview: layers.some(layer => layer.kind !== 'CANON'),
+        layers,
+    };
+};
+
+const markTruthForReview = (truth?: TruthBundle): TruthBundle | undefined =>
+    truth
+        ? { ...truth, needsReview: truth.layers.some(layer => layer.kind !== 'CANON') }
+        : truth;
+
+const normalizeAliasList = (aliases?: string[]): string[] => {
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (const alias of aliases ?? []) {
+        const trimmed = alias.trim();
+        if (!trimmed) continue;
+        const key = trimmed.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        result.push(trimmed);
+    }
+    return result;
+};
+
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const normalizeMatchValue = (value: string, caseSensitive: boolean): string => caseSensitive ? value : value.toLowerCase();
+const buildTrackedTerms = (name: string, aliases: string[], tracking?: TrackingConfig): string[] => {
+    const base = tracking?.trackByAlias === false ? [name] : [name, ...aliases];
+    return normalizeAliasList(base).sort((a, b) => b.length - a.length);
+};
+
+const containsTrackedTerm = (text: string, terms: string[], tracking?: TrackingConfig): boolean => {
+    if (!text.trim() || terms.length === 0) return false;
+    const caseSensitive = tracking?.caseSensitive ?? DEFAULT_TRACKING.caseSensitive;
+    const exclusions = normalizeAliasList(tracking?.exclusions).map(item => normalizeMatchValue(item, caseSensitive));
+    const candidate = normalizeMatchValue(text, caseSensitive);
+    if (exclusions.some(exclusion => exclusion && candidate.includes(exclusion))) return false;
+    return terms.some(term => {
+        const needle = normalizeMatchValue(term, caseSensitive);
+        if (!needle) return false;
+        const pattern = new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRegExp(needle)}([^\\p{L}\\p{N}]|$)`, caseSensitive ? 'u' : 'iu');
+        return pattern.test(candidate);
+    });
+};
+
+const inferTimelineEventState = (title: string, content: string): TimelineEventState => {
+    const blob = normalizeTitle(`${title} ${content}`);
+    if (/(profecia|prophecy|premon|forecast|previsto|pressagio|presságio)/.test(blob)) return 'forecast';
+    if (/(veneno|maldicao|maldição|timer|contagem|prazo|ritual em curso|ca[cç]a|pursuit|persegui)/.test(blob)) return 'active_pressure';
+    if (/(latente|selado|adormecido|hibernando|dormente|esperando)/.test(blob)) return 'latent';
+    if (/(resolvido|encerrado|curado|closed|resolved|apurado|concluido|concluído)/.test(blob)) return 'resolved';
+    return 'historical';
+};
+
+const inferTimelineDiscoveryKind = (title: string, content: string): TimelineDiscoveryKind => {
+    const blob = normalizeTitle(`${title} ${content}`);
+    if (/(flashback|visao|visão|recordacao|recordação|descoberta|revela|memory recovered|vision)/.test(blob)) return 'present_discovery';
+    if (/(profecia|prophecy|premon|forecast)/.test(blob)) return 'forecast';
+    return 'past_occurrence';
+};
+
+const inferRelatedEntityIds = (universe: Universe, text: string, excludeId?: string): string[] => {
+    const prepared = ensureUniverseDefaults(universe);
+    const pools: Array<{ id: string; name: string; aliases: string[]; tracking?: TrackingConfig }> = [
+        ...prepared.characters.map(character => ({ id: character.id, name: character.name, aliases: character.aliases, tracking: character.tracking })),
+        ...prepared.codex.factions.map(entry => ({ id: entry.id, name: entry.title, aliases: entry.aliases, tracking: entry.tracking })),
+        ...prepared.codex.rules.map(entry => ({ id: entry.id, name: entry.title, aliases: entry.aliases, tracking: entry.tracking })),
+        ...prepared.codex.timeline.map(entry => ({ id: entry.id, name: entry.title, aliases: entry.aliases, tracking: entry.tracking })),
+    ];
+
+    return pools
+        .filter(item => item.id !== excludeId)
+        .filter(item => containsTrackedTerm(text, buildTrackedTerms(item.name, item.aliases, item.tracking), item.tracking))
+        .map(item => item.id);
+};
+
+const ensureCodexEntryDefaults = (entry: CodexEntry): CodexEntry => ({
+    ...entry,
+    aliases: normalizeAliasList(entry.aliases),
+    aiVisibility: entry.aiVisibility ?? DEFAULT_AI_VISIBILITY,
+    notesPrivate: entry.notesPrivate ?? '',
+    tracking: {
+        ...DEFAULT_TRACKING,
+        ...(entry.tracking ?? {}),
+        exclusions: normalizeAliasList(entry.tracking?.exclusions),
+    },
+    truth: entry.truth ?? createTruthBundle(entry.id || generateId(), entry.content),
+    relatedEntityIds: entry.relatedEntityIds ?? [],
+    dependsOnIds: entry.dependsOnIds ?? [],
+    eventState: entry.eventState,
+    discoveryKind: entry.discoveryKind,
+});
+
+const ensureCharacterDefaults = (character: Character): Character => ({
+    ...character,
+    aliases: normalizeAliasList(character.aliases),
+    aiVisibility: character.aiVisibility ?? DEFAULT_AI_VISIBILITY,
+    notesPrivate: character.notesPrivate ?? '',
+    tracking: {
+        ...DEFAULT_TRACKING,
+        ...(character.tracking ?? {}),
+        exclusions: normalizeAliasList(character.tracking?.exclusions),
+    },
+});
+
+const ensureSyncMeta = (syncMeta?: SyncMeta): SyncMeta => ({
+    canonVersion: syncMeta?.canonVersion ?? 1,
+    memoryVersion: syncMeta?.memoryVersion ?? 1,
+    dirtyScopes: syncMeta?.dirtyScopes ?? [],
+    lastSyncAt: syncMeta?.lastSyncAt,
+    lastSyncMode: syncMeta?.lastSyncMode,
+});
+
+const ensureUniverseDefaults = (universe: Universe): Universe => ({
+    ...universe,
+    subtitle: universe.subtitle ?? '',
+    notesPrivate: universe.notesPrivate ?? '',
+    codex: {
+        ...universe.codex,
+        overview: universe.codex.overview ?? '',
+        timeline: universe.codex.timeline.map(ensureCodexEntryDefaults),
+        factions: universe.codex.factions.map(ensureCodexEntryDefaults),
+        rules: universe.codex.rules.map(ensureCodexEntryDefaults),
+    },
+    characters: universe.characters.map(ensureCharacterDefaults),
+    chapters: universe.chapters.map(chapter => ({
+        ...chapter,
+        aiVisibility: chapter.aiVisibility ?? DEFAULT_AI_VISIBILITY,
+        notesPrivate: chapter.notesPrivate ?? '',
+    })),
+    narrativeMemory: universe.narrativeMemory ? {
+        ...universe.narrativeMemory,
+        lexicalCooldownGuidance: universe.narrativeMemory.lexicalCooldownGuidance ?? {},
+        lieStates: universe.narrativeMemory.lieStates ?? [],
+    } : universe.narrativeMemory,
+    syncMeta: ensureSyncMeta(universe.syncMeta),
+});
 
 const limitItems = <T,>(items: T[], maxItems: number): T[] => items.slice(0, Math.max(0, maxItems));
 const truncateText = (value: string | undefined, maxChars: number): string => {
@@ -83,8 +285,8 @@ const COMPACT_AGENT_PROMPTS: Partial<Record<string, string>> = {
     architect: 'Create a coherent fictional universe with strong atmosphere, opposing factions, and clear limits. Return only what was requested.',
     soulforger: 'Create psychologically coherent characters with a Ghost and a Lie. Keep the protagonist active and concrete.',
     director: 'Analyse narrative health: open loops, faction balance, protagonist agency. Issue per-chapter guidance JSON only.',
-    weaver: 'Plan 5-7 causal beats. Each beat must include actor, action, obstacle, and consequence. Output structured JSON only.',
-    bard: 'Write continuous narrative prose only. No headers or meta text. Start concrete, maintain POV, dramatize actions, and avoid repetition or cliches.',
+    weaver: 'Plan 5-7 causal beats. Each beat must include actor, action, obstacle, and consequence. Avoid textbook plot labels and generic screenplay scaffolding. Output structured JSON only.',
+    bard: 'Write continuous narrative prose only. No headers or meta text. Start concrete, maintain POV, dramatize actions, avoid repetition or cliches, and vary sentence temperature between clean action, sensory detail, and only occasional high-intensity lines.',
     chronicler: 'Extract explicit facts into the requested JSON only. Reuse known character IDs, avoid invention, and only record stable codex facts.',
     lector: 'Polish the chapter with minimal edits. Remove repetition and banned phrases without shrinking the chapter materially.',
 };
@@ -217,12 +419,10 @@ const cleanLanguageLeakage = (text: string, lang?: 'pt' | 'en'): string => {
 // ─── Clients ─────────────────────────────────────────────────────────────────
 
 
-const getClient = (): OpenAI => {
+const getGroqClient = (): OpenAI | null => {
     const keys = loadApiKeys();
     const apiKey = keys?.groq;
-    if (!apiKey) {
-        throw new Error('Groq API key not found in local browser storage.');
-    }
+    if (!apiKey) return null;
     return new OpenAI({
         apiKey,
         baseURL: GROQ_BASE_URL,
@@ -250,6 +450,21 @@ const getCerebrasClient = (): OpenAI | null => {
     return new OpenAI({
         apiKey,
         baseURL: CEREBRAS_BASE_URL,
+        dangerouslyAllowBrowser: true,
+    });
+};
+
+const getOpenRouterClient = (): OpenAI | null => {
+    const keys = loadApiKeys();
+    const apiKey = keys?.openrouter;
+    if (!apiKey) return null;
+    return new OpenAI({
+        apiKey,
+        baseURL: OPENROUTER_BASE_URL,
+        defaultHeaders: {
+            'HTTP-Referer': typeof window !== 'undefined' ? window.location.origin : 'http://localhost',
+            'X-Title': 'Mythos Engine',
+        },
         dangerouslyAllowBrowser: true,
     });
 };
@@ -347,9 +562,10 @@ const chat = async ({
     temperature?: number;
     maxTokens?: number;
     label?: string;
-    provider?: 'groq' | 'gemini' | 'cerebras' | 'auto';
+    provider?: 'groq' | 'gemini' | 'cerebras' | 'openrouter' | 'auto';
 }): Promise<string> => {
-    const client = getClient();
+    const keys = loadApiKeys();
+    const client = getGroqClient();
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
 
     if (system?.trim()) {
@@ -358,6 +574,26 @@ const chat = async ({
     messages.push({ role: 'user', content: user });
 
     const defaultTemp = temperature ?? (json ? 0.4 : 0.8);
+    const preferredProvider = provider === 'auto' ? (keys?.preferredProvider ?? 'auto') : provider;
+    const executeOpenRouter = async (withJsonMode: boolean, modelOverride?: string): Promise<string> => {
+        const openRouterClient = getOpenRouterClient();
+        if (!openRouterClient) throw new Error('OPENROUTER_API_KEY not configured.');
+        const openRouterModel = modelOverride ?? OPENROUTER_DEFAULT_MODEL;
+        const completion = await openRouterClient.chat.completions.create({
+            model: openRouterModel,
+            messages,
+            temperature: defaultTemp,
+            ...(withJsonMode ? { response_format: { type: 'json_object' } } : {}),
+            ...(maxTokens ? { max_tokens: maxTokens } : {}),
+        });
+        const u = completion.usage;
+        if (u) emitUsage({ provider: 'openrouter', model: openRouterModel, label, inputTokens: u.prompt_tokens, outputTokens: u.completion_tokens, totalTokens: u.total_tokens });
+        return extractText(completion.choices[0]?.message?.content).trim();
+    };
+
+    if (provider === 'openrouter') {
+        return executeOpenRouter(json, model !== DEFAULT_MODEL ? model : OPENROUTER_DEFAULT_MODEL);
+    }
 
     // ── Direct Cerebras routing (bypass Groq/Gemini entirely) ─────────────────
     if (provider === 'cerebras') {
@@ -406,7 +642,32 @@ const chat = async ({
         }
     }
 
+    if (preferredProvider === 'openrouter' && keys?.openrouter.trim()) {
+        try {
+            return await executeOpenRouter(json);
+        } catch (error) {
+            console.warn('[MythosEngine] OpenRouter preferred provider failed â€” falling back.', error);
+        }
+    }
+
+    if (preferredProvider === 'gemini' && keys?.gemini.trim()) {
+        try {
+            return await executeGemini(json);
+        } catch (error) {
+            console.warn('[MythosEngine] Gemini preferred provider failed â€” falling back.', error);
+        }
+    }
+
+    if (preferredProvider === 'cerebras' && keys?.cerebras.trim()) {
+        try {
+            return await executeCerebras(json);
+        } catch (error) {
+            console.warn('[MythosEngine] Cerebras preferred provider failed â€” falling back.', error);
+        }
+    }
+
     const execute = async (activeModel: string, withJsonMode: boolean) => {
+        if (!client) throw new Error('GROQ_API_KEY not configured.');
         const completion = await client.chat.completions.create({
             model: activeModel,
             messages,
@@ -507,6 +768,13 @@ const chat = async ({
 
     // ── Full fallback chain: Gemini 2.5 → Gemini 2.0 → Cerebras qwen-3-235b → llama3.1-8b ──
     const tryFallbackProviders = async (reason: string): Promise<string> => {
+        if (keys?.openrouter.trim()) {
+            try {
+                return await executeOpenRouter(json);
+            } catch {
+                console.warn(`[MythosEngine] OpenRouter ${OPENROUTER_DEFAULT_MODEL} failed â€” trying Gemini.`);
+            }
+        }
         console.warn(`[MythosEngine] ${reason} — chain: Gemini 2.5 → Gemini 2.0 → Cerebras ${CEREBRAS_DEFAULT_MODEL} → ${CEREBRAS_LAST_RESORT}`);
         // Step 1: Gemini 2.5 (executeGemini already retries with 2.0 internally)
         try {
@@ -517,6 +785,10 @@ const chat = async ({
         // Step 2: Cerebras primary → llama3.1-8b (executeCerebras retries internally)
         return executeCerebras(json);
     };
+
+    if (!client) {
+        return tryFallbackProviders('No primary provider configured');
+    }
 
     try {
         return await execute(model, json);
@@ -548,6 +820,11 @@ const ZDirectorGuidance = z.object({
     thematicConstraint:     z.string().min(1),
     narrativePressure:      z.string().min(1),
     wordsToSetOnCooldown:   z.array(z.string()).default([]),
+    cooldownSubstitutions:  z.array(z.object({ term: z.string(), note: z.string() })).default([]),
+    contradictionSummary:   z.string().default(''),
+    liePressureSource:      z.string().default(''),
+    protagonistLieStability:z.number().min(1).max(10).default(10),
+    ruptureRequired:        z.boolean().default(false),
 });
 
 const ZWeaverPlan = z.object({
@@ -569,6 +846,8 @@ const ZSurgicalLectorOutput = z.object({
     wordOveruse:          z.array(z.string()).default([]),
     passiveProtagonist:   z.enum(['sim', 'não']).default('não'),
     sceneObjectiveCheck:  z.enum(['ok', 'complicado', 'falhou']).default('ok'),
+    rhetoricalPatternOveruse: z.string().default(''),
+    rhetoricalPatternCount: z.number().int().min(0).default(0),
 });
 
 const ZChroniclerOutput = z.object({
@@ -593,6 +872,8 @@ const ZChroniclerOutput = z.object({
         wordOveruse:          z.array(z.string()).optional(),
         sceneObjectiveCheck:  z.string().optional(),
         passiveProtagonist:   z.string().optional(),
+        rhetoricalPatternOveruse: z.string().optional(),
+        rhetoricalPatternCount: z.number().optional(),
     }).optional(),
 });
 
@@ -698,27 +979,78 @@ const getAgentPrompt = (universe: Universe | null, agentId: string, compact = fa
     return DEFAULT_AGENTS[agentId]?.systemPrompt || 'You are a helpful AI assistant.';
 };
 
+const isVisibleToAI = (visibility?: AIVisibility): boolean => (visibility ?? DEFAULT_AI_VISIBILITY) !== 'hidden';
+const isGlobalToAI = (visibility?: AIVisibility): boolean => (visibility ?? DEFAULT_AI_VISIBILITY) === 'global';
+
+const formatAliasesInline = (aliases?: string[]): string =>
+    normalizeAliasList(aliases).length > 0 ? ` (aliases: ${normalizeAliasList(aliases).join(', ')})` : '';
+
+const sortByVisibility = <T extends { aiVisibility?: AIVisibility }>(items: T[]): T[] => {
+    const visible = items.filter(item => isVisibleToAI(item.aiVisibility));
+    return [
+        ...visible.filter(item => isGlobalToAI(item.aiVisibility)),
+        ...visible.filter(item => !isGlobalToAI(item.aiVisibility)),
+    ];
+};
+
+const collectEffectiveCodexEntries = (
+    entries: CodexEntry[],
+    compact: boolean,
+    maxItems: number,
+): CodexEntry[] => {
+    const sorted = sortByVisibility(entries);
+    if (!compact) return sorted;
+    const globals = sorted.filter(entry => isGlobalToAI(entry.aiVisibility));
+    const tracked = sorted.filter(entry => !isGlobalToAI(entry.aiVisibility));
+    return [...globals, ...limitItems(tracked, Math.max(0, maxItems - globals.length))].slice(0, maxItems);
+};
+
+const collectEffectiveTimelineEntries = (
+    entries: CodexEntry[],
+    compact: boolean,
+    maxItems: number,
+    relatedEntityIds: string[] = [],
+): CodexEntry[] => {
+    const sorted = sortByVisibility(entries);
+    const activePressure = sorted.filter(entry => entry.eventState === 'active_pressure');
+    const related = sorted.filter(entry =>
+        (entry.relatedEntityIds ?? []).some(id => relatedEntityIds.includes(id)) && !activePressure.some(active => active.id === entry.id)
+    );
+    const globals = sorted.filter(entry =>
+        isGlobalToAI(entry.aiVisibility) &&
+        !activePressure.some(active => active.id === entry.id) &&
+        !related.some(item => item.id === entry.id)
+    );
+    const remaining = sorted.filter(entry =>
+        !activePressure.some(active => active.id === entry.id) &&
+        !related.some(item => item.id === entry.id) &&
+        !globals.some(item => item.id === entry.id)
+    );
+    const prioritized = [...activePressure, ...related, ...globals, ...remaining];
+    return compact ? prioritized.slice(0, maxItems) : prioritized;
+};
+
 const buildUniverseContext = (
     universe: Universe,
-    options?: { compact?: boolean; maxFactions?: number; maxRules?: number; maxTimeline?: number }
+    options?: { compact?: boolean; maxFactions?: number; maxRules?: number; maxTimeline?: number; relatedEntityIds?: string[] }
 ): string => {
     const compact = options?.compact ?? false;
-    const factions = compact ? limitItems(universe.codex.factions, options?.maxFactions ?? 2) : universe.codex.factions;
-    const rules = compact ? limitItems(universe.codex.rules, options?.maxRules ?? 4) : universe.codex.rules;
-    const timeline = compact ? limitItems(universe.codex.timeline, options?.maxTimeline ?? 2) : universe.codex.timeline;
+    const factions = collectEffectiveCodexEntries(universe.codex.factions, compact, options?.maxFactions ?? 2);
+    const rules = collectEffectiveCodexEntries(universe.codex.rules, compact, options?.maxRules ?? 4);
+    const timeline = collectEffectiveTimelineEntries(universe.codex.timeline, compact, options?.maxTimeline ?? 2, options?.relatedEntityIds ?? []);
     return `
     === WORLD CODEX: ${universe.name} ===
     DESCRIPTION: ${truncateText(universe.description, compact ? 140 : 400)}
     OVERVIEW: ${truncateText(universe.codex.overview, compact ? 220 : 700)}
 
     --- KEY FACTIONS ---
-    ${factions.map(f => `- ${f.title}: ${truncateText(f.content, compact ? 120 : 240)}`).join('\n') || '- None recorded.'}
+    ${factions.map(f => `- ${f.title}${formatAliasesInline(f.aliases)}: ${truncateText(f.content, compact ? 120 : 240)}`).join('\n') || '- None recorded.'}
 
     --- WORLD RULES & MAGIC ---
-    ${rules.map(r => `- ${r.title}: ${truncateText(r.content, compact ? 120 : 240)}`).join('\n') || '- None recorded.'}
+    ${rules.map(r => `- ${r.title}${formatAliasesInline(r.aliases)}: ${truncateText(r.content, compact ? 120 : 240)}`).join('\n') || '- None recorded.'}
 
     --- TIMELINE ---
-    ${timeline.map(t => `- ${t.title}: ${truncateText(t.content, compact ? 120 : 240)}`).join('\n') || '- None recorded.'}
+    ${timeline.map(t => `- ${t.title}${formatAliasesInline(t.aliases)} [${t.eventState ?? 'historical'}${t.discoveryKind ? ` / ${t.discoveryKind}` : ''}]: ${truncateText(t.content, compact ? 120 : 240)}`).join('\n') || '- None recorded.'}
     `;
 };
 
@@ -727,15 +1059,26 @@ const buildCompactCharacterList = (universe: Universe): string => {
     const stateMap = new Map(
         (universe.narrativeMemory?.characterStates ?? []).map(cs => [cs.name, cs])
     );
-    return universe.characters.map(c => {
+    return sortByVisibility(universe.characters).map(c => {
         const st = stateMap.get(c.name);
         const state = st ? ` | ${st.status}${st.location ? ` @ ${st.location}` : ''}` : '';
-        return `${c.name} (${c.role})${state}`;
+        return `${c.name}${formatAliasesInline(c.aliases)} (${c.role})${state}`;
     }).join('\n');
 };
 
+const deriveContextEntityIds = (universe: Universe, activeCharacterIds: string[]): string[] => {
+    const ids = new Set<string>(activeCharacterIds);
+    for (const character of universe.characters.filter(item => activeCharacterIds.includes(item.id))) {
+        if (character.faction) {
+            const matchingFaction = universe.codex.factions.find(entry => normalizeTitle(entry.title) === normalizeTitle(character.faction));
+            if (matchingFaction) ids.add(matchingFaction.id);
+        }
+    }
+    return Array.from(ids);
+};
+
 const buildCharacterContext = (universe: Universe, activeIds: string[], compact = false): string => {
-    const activeChars = universe.characters.filter(c => activeIds.includes(c.id));
+    const activeChars = universe.characters.filter(c => activeIds.includes(c.id) && isVisibleToAI(c.aiVisibility));
     if (activeChars.length === 0) return 'NO SPECIFIC CHARACTERS SELECTED. FOCUS ON WORLD ATMOSPHERE.';
 
     // Delta mode for chapter 2+: use live state from narrative memory to save tokens
@@ -750,10 +1093,10 @@ const buildCharacterContext = (universe: Universe, activeIds: string[], compact 
     ${activeChars.map(c => {
             const st = stateMap.get(c.name);
             if (st) {
-                return `- ${c.name} (${c.role}${c.faction ? ` / ${c.faction}` : ''}) [${st.status}]${st.location ? ` @ ${truncateText(st.location, compact ? 50 : 120)}` : ''}${st.emotionalState ? ` | mood: ${truncateText(st.emotionalState, compact ? 40 : 90)}` : ''}${st.lastAction ? ` | last: ${truncateText(st.lastAction, compact ? 70 : 160)}` : ''}`;
+                return `- ${c.name}${formatAliasesInline(c.aliases)} (${c.role}${c.faction ? ` / ${c.faction}` : ''}) [${st.status}]${st.location ? ` @ ${truncateText(st.location, compact ? 50 : 120)}` : ''}${st.emotionalState ? ` | mood: ${truncateText(st.emotionalState, compact ? 40 : 90)}` : ''}${st.lastAction ? ` | last: ${truncateText(st.lastAction, compact ? 70 : 160)}` : ''}`;
             }
             // Fallback: character not yet in memory → include bio (new character intro)
-            return `- ${c.name} (${c.role}${c.faction ? ` / ${c.faction}` : ''}) — ${truncateText(c.bio, compact ? 110 : 260)}`;
+            return `- ${c.name}${formatAliasesInline(c.aliases)} (${c.role}${c.faction ? ` / ${c.faction}` : ''}) — ${truncateText(c.bio, compact ? 110 : 260)}`;
         }).join('\n')}
     `;
     }
@@ -763,6 +1106,7 @@ const buildCharacterContext = (universe: Universe, activeIds: string[], compact 
     === ACTIVE CHARACTERS IN SCENE ===
     ${activeChars.map(c => `
     NAME: ${c.name}
+    ALIASES: ${normalizeAliasList(c.aliases).join(', ') || 'None'}
     ROLE: ${c.role}
     FACTION: ${c.faction}
     BIO: ${truncateText(c.bio, compact ? 120 : 320)}
@@ -812,6 +1156,10 @@ const buildMemoryContext = (universe: Universe, chapterIndex?: number, compact =
     const recentText = recentEvents.length > 0
         ? recentEvents.map(e => `- ${truncateText(e, compact ? 100 : 220)}`).join('\n')
         : 'No recent events.';
+    const lieStates = compact ? limitItems(mem.lieStates ?? [], 2) : (mem.lieStates ?? []);
+    const lieText = lieStates.length > 0
+        ? lieStates.map(state => `- ${state.name}: stability ${state.lieStability}/10 | pressure: ${state.pressureSources.join(', ') || 'none'} | contradictions: ${truncateText(state.contradictions.slice(-2).join(' / '), compact ? 120 : 240) || 'none'}${state.ruptureRequired ? ' | rupture required soon' : ''}`).join('\n')
+        : 'No lie-state tracking recorded yet.';
 
     // Quality flags from the previous Chronicler audit
     const auditSection = mem.lastAuditFlags
@@ -831,6 +1179,9 @@ const buildMemoryContext = (universe: Universe, chapterIndex?: number, compact =
             }
             if (mem.lastAuditFlags.sceneObjectiveCheck && mem.lastAuditFlags.sceneObjectiveCheck !== 'ok') {
                 lines.push('SCENE STAGNATION detected — Do NOT plan any beat where characters only talk or wait. Each scene: new location OR new item OR new threat OR new alliance.');
+            }
+            if (mem.lastAuditFlags.rhetoricalPatternOveruse) {
+                lines.push('RHETORICAL PATTERN OVERUSE detected — ban contrastive-negation crutches like "não X, mas Y", "não era..., mas..." and "em vez disso". Build contrast through action, image, or consequence instead of self-correcting sentence shapes, and default to affirmative syntax.');
             }
             return lines.length > 0
                 ? `\nQUALITY MANDATE (fix from previous chapter):\n${lines.join('\n')}`
@@ -864,6 +1215,9 @@ ${charStates}
 
 OPEN PLOT THREADS (must be addressed or complicated):
 ${loopsText}
+
+LIE STATE TRACKING:
+${lieText}
 ${auditSection}
 ===================================================================
 `;
@@ -894,9 +1248,38 @@ const buildBardMemoryHints = (universe: Universe, chapterIndex?: number, compact
         hints.push(`BANNED WORDS (do NOT use these — they were overused in previous chapters): ${limitItems(allBanned, compact ? 10 : 20).join(', ')}`);
     }
 
+    const substitutionRules = allBanned.map(word => {
+        const rule = mem.lexicalCooldownGuidance?.[word.toLowerCase()];
+        return `- ${word}: ${rule || 'Do not name it directly; use sensory description, metaphor, action, or consequence instead.'}`;
+    });
+    if (substitutionRules.length) {
+        hints.push(`LEXICAL SUBSTITUTION RULES:\n${substitutionRules.join('\n')}`);
+    }
+
     // Passive protagonist escalation
     if (mem.lastAuditFlags?.passiveProtagonist === 'sim') {
         hints.push('⚠️ PASSIVE PROTAGONIST flagged — protagonist was passive last chapter. Every beat in this chapter: protagonist must initiate an action (move, grab, decide, fight, escape, confront). Zero passive observation allowed.');
+    }
+    if (mem.lastAuditFlags?.rhetoricalPatternOveruse) {
+        hints.push(`RHETORICAL CRUTCH BAN: ${mem.lastAuditFlags.rhetoricalPatternOveruse} Build contrast through image, sequence, consequence, and syntax variety — not through formulas like "não X, mas Y", "não era..., mas..." or "em vez disso". Use affirmative syntax by default.`);
+    }
+
+    if (mem.lastAuditFlags?.rhetoricalPatternCount && mem.lastAuditFlags.rhetoricalPatternCount >= 3) {
+        hints.push('FORM RESTRICTION: maximum one contrastive-negation construction in the whole chapter, preferably zero. Rewrite sentences into direct image, direct action, or direct consequence instead of sentence-internal correction.');
+    }
+
+    const protagonist = universe.characters[0];
+    const lieState = protagonist
+        ? mem.lieStates?.find(state => state.characterId === protagonist.id)
+        : undefined;
+    if (lieState) {
+        hints.push(`CORE LIE TRACKING: ${lieState.name} believes "${lieState.coreLie}". Stability ${lieState.lieStability}/10. Pressure: ${lieState.pressureSources.join(', ') || 'none'}.`);
+        if (lieState.contradictions.length) {
+            hints.push(`LATEST CONTRADICTIONS:\n${lieState.contradictions.slice(-3).map(item => `- ${item}`).join('\n')}`);
+        }
+        if (lieState.ruptureRequired) {
+            hints.push('RUPTURE REQUIRED: the next chapter must force ideological fracture, confession, or a choice that the lie cannot survive.');
+        }
     }
 
     if (hints.length === 0) return '';
@@ -959,6 +1342,24 @@ const truncateRepetitionLoops = (text: string): string => {
     return kept.join('\n\n').trim();
 };
 
+const countContrastiveNegationPatterns = (text: string): { count: number; message?: string } => {
+    if (!text.trim()) return { count: 0 };
+    const patterns = [
+        /\bn[aã]o\b[^.!?\n]{0,120}\bmas\b/giu,
+        /\bnot\b[^.!?\n]{0,120}\bbut\b/giu,
+        /\bem vez disso\b/giu,
+        /\binstead\b[^.!?\n]{0,80}/giu,
+        /\bn[aã]o era\b[^.!?\n]{0,120}\bmas\b/giu,
+        /\bwasn't\b[^.!?\n]{0,120}\bbut\b/giu,
+    ];
+    const count = patterns.reduce((total, pattern) => total + (text.match(pattern)?.length ?? 0), 0);
+    if (count < 3) return { count };
+    return {
+        count,
+        message: `Excessive contrastive-negation rhetoric detected (${count} hits). Avoid relying on structures like "não X, mas Y", "não era..., mas...", or "em vez disso" as a default literary crutch.`,
+    };
+};
+
 // ─── Creativity Seeds: Faction Archetypes + Protagonist Backgrounds ──────────
 
 const FACTION_ARCHETYPES: { type: string; hint: string }[] = [
@@ -1002,6 +1403,183 @@ const pickBackground = (): string => {
     return PROTAGONIST_BACKGROUNDS[Math.floor(Math.random() * PROTAGONIST_BACKGROUNDS.length)];
 };
 
+const deriveRecentEventsFromChapters = (chapters: Chapter[]): string[] =>
+    chapters
+        .filter(ch => (ch.aiVisibility ?? DEFAULT_AI_VISIBILITY) !== 'hidden')
+        .slice(-5)
+        .map(ch => ch.summary || ch.endHook || ch.title)
+        .filter(Boolean);
+
+export const markUniverseDirty = (universe: Universe, scopes: DirtyScope[]): Universe => {
+    const prepared = ensureUniverseDefaults(universe);
+    const nextScopes = Array.from(new Set([...(prepared.syncMeta?.dirtyScopes ?? []), ...scopes]));
+    return {
+        ...prepared,
+        syncMeta: {
+            ...ensureSyncMeta(prepared.syncMeta),
+            canonVersion: (prepared.syncMeta?.canonVersion ?? 1) + 1,
+            dirtyScopes: nextScopes,
+        },
+    };
+};
+
+export const syncUniverseCanon = (
+    universe: Universe,
+    mode: 'light' | 'deep' = 'light',
+): Universe => {
+    const prepared = ensureUniverseDefaults(universe);
+    const dirtyScopes = prepared.syncMeta?.dirtyScopes ?? [];
+    const narrativeMemory = prepared.narrativeMemory
+        ? {
+            ...prepared.narrativeMemory,
+            characterStates: prepared.narrativeMemory.characterStates.map(state => {
+                const matchingCharacter = prepared.characters.find(character => character.id === state.characterId);
+                return matchingCharacter
+                    ? { ...state, name: matchingCharacter.name, status: matchingCharacter.status }
+                    : state;
+            }),
+          }
+        : undefined;
+
+    const chapterVisibility = prepared.chapters.filter(chapter => (chapter.aiVisibility ?? DEFAULT_AI_VISIBILITY) !== 'hidden');
+    const latestChapter = chapterVisibility[chapterVisibility.length - 1];
+
+    const syncedMemory: NarrativeMemory | undefined = narrativeMemory || dirtyScopes.length > 0
+        ? {
+            lastChapterIndex: latestChapter ? prepared.chapters.findIndex(ch => ch.id === latestChapter.id) : prepared.narrativeMemory?.lastChapterIndex ?? 0,
+            globalSummary: dirtyScopes.some(scope => scope === 'chapters' || scope === 'project')
+                ? latestChapter?.summary || prepared.narrativeMemory?.globalSummary || ''
+                : prepared.narrativeMemory?.globalSummary || latestChapter?.summary || '',
+            characterStates: narrativeMemory?.characterStates ?? prepared.characters.map(character => ({
+                characterId: character.id,
+                name: character.name,
+                status: character.status,
+            })),
+            openLoops: prepared.narrativeMemory?.openLoops ?? [],
+            recentEvents: dirtyScopes.some(scope => scope === 'chapters')
+                ? deriveRecentEventsFromChapters(prepared.chapters)
+                : prepared.narrativeMemory?.recentEvents ?? deriveRecentEventsFromChapters(prepared.chapters),
+            newCodexEntries: prepared.narrativeMemory?.newCodexEntries ?? { factions: [], rules: [], timeline: [] },
+            lastAuditFlags: prepared.narrativeMemory?.lastAuditFlags,
+            lexicalCooldown: prepared.narrativeMemory?.lexicalCooldown,
+            lexicalCooldownGuidance: prepared.narrativeMemory?.lexicalCooldownGuidance ?? {},
+            lieStates: prepared.narrativeMemory?.lieStates ?? [],
+            directorGuidance: dirtyScopes.length > 0 ? undefined : prepared.narrativeMemory?.directorGuidance,
+        }
+        : undefined;
+
+    return {
+        ...prepared,
+        narrativeMemory: syncedMemory,
+        syncMeta: {
+            ...ensureSyncMeta(prepared.syncMeta),
+            memoryVersion: (prepared.syncMeta?.memoryVersion ?? 1) + (dirtyScopes.length > 0 ? 1 : 0),
+            dirtyScopes: [],
+            lastSyncAt: new Date().toISOString(),
+            lastSyncMode: mode,
+        },
+    };
+};
+
+export interface MentionHit {
+    sourceType: 'chapter' | 'summary' | 'codex' | 'memory';
+    sourceId: string;
+    label: string;
+    excerpt: string;
+}
+
+export const collectCharacterMentions = (universe: Universe, character: Character): MentionHit[] => {
+    const prepared = ensureUniverseDefaults(universe);
+    const terms = buildTrackedTerms(character.name, character.aliases, character.tracking);
+    const hits: MentionHit[] = [];
+
+    for (const chapter of prepared.chapters) {
+        const sources = [
+            { bucket: 'chapter' as const, label: chapter.title, text: chapter.content },
+            { bucket: 'summary' as const, label: `${chapter.title} · resumo`, text: `${chapter.summary} ${chapter.endHook ?? ''}`.trim() },
+        ];
+        for (const source of sources) {
+            if (containsTrackedTerm(source.text, terms, character.tracking)) {
+                hits.push({ sourceType: source.bucket, sourceId: chapter.id, label: source.label, excerpt: truncateText(source.text, 180) });
+            }
+        }
+    }
+
+    if (containsTrackedTerm(prepared.codex.overview, terms, character.tracking)) {
+        hits.push({ sourceType: 'codex', sourceId: 'overview', label: 'Codex · overview', excerpt: truncateText(prepared.codex.overview, 180) });
+    }
+
+    for (const entry of [...prepared.codex.factions, ...prepared.codex.rules, ...prepared.codex.timeline]) {
+        if (containsTrackedTerm(`${entry.title} ${entry.content}`, terms, character.tracking)) {
+            hits.push({ sourceType: 'codex', sourceId: entry.id, label: entry.title, excerpt: truncateText(entry.content, 180) });
+        }
+    }
+
+    const mem = prepared.narrativeMemory;
+    if (mem) {
+        const memoryBlocks = [
+            { id: 'globalSummary', label: 'Memoria · resumo global', text: mem.globalSummary },
+            { id: 'recentEvents', label: 'Memoria · eventos recentes', text: mem.recentEvents.join(' ') },
+            { id: 'openLoops', label: 'Memoria · pontas abertas', text: mem.openLoops.map(loop => loop.description).join(' ') },
+            { id: 'characterStates', label: 'Memoria · estados', text: mem.characterStates.map(state => `${state.name} ${state.status} ${state.location ?? ''} ${state.emotionalState ?? ''} ${state.lastAction ?? ''}`).join(' ') },
+        ];
+        for (const block of memoryBlocks) {
+            if (containsTrackedTerm(block.text, terms, character.tracking)) {
+                hits.push({ sourceType: 'memory', sourceId: block.id, label: block.label, excerpt: truncateText(block.text, 180) });
+            }
+        }
+    }
+
+    return hits;
+};
+
+export const collectCodexEntryMentions = (universe: Universe, entry: CodexEntry): MentionHit[] => {
+    const prepared = ensureUniverseDefaults(universe);
+    const terms = buildTrackedTerms(entry.title, entry.aliases, entry.tracking);
+    const hits: MentionHit[] = [];
+
+    for (const chapter of prepared.chapters) {
+        const sources = [
+            { bucket: 'chapter' as const, label: chapter.title, text: chapter.content },
+            { bucket: 'summary' as const, label: `${chapter.title} · resumo`, text: `${chapter.summary} ${chapter.endHook ?? ''}`.trim() },
+        ];
+        for (const source of sources) {
+            if (containsTrackedTerm(source.text, terms, entry.tracking)) {
+                hits.push({ sourceType: source.bucket, sourceId: chapter.id, label: source.label, excerpt: truncateText(source.text, 180) });
+            }
+        }
+    }
+
+    const codexPools = [
+        ...prepared.characters.map(character => ({ id: character.id, title: character.name, text: character.bio })),
+        ...prepared.codex.factions.map(item => ({ id: item.id, title: item.title, text: item.content })),
+        ...prepared.codex.rules.map(item => ({ id: item.id, title: item.title, text: item.content })),
+        ...prepared.codex.timeline.map(item => ({ id: item.id, title: item.title, text: item.content })),
+    ];
+    for (const item of codexPools) {
+        if (item.id === entry.id) continue;
+        if (containsTrackedTerm(`${item.title} ${item.text}`, terms, entry.tracking)) {
+            hits.push({ sourceType: 'codex', sourceId: item.id, label: item.title, excerpt: truncateText(item.text, 180) });
+        }
+    }
+
+    const mem = prepared.narrativeMemory;
+    if (mem) {
+        const memoryBlocks = [
+            { id: 'globalSummary', label: 'Memoria · resumo global', text: mem.globalSummary },
+            { id: 'recentEvents', label: 'Memoria · eventos recentes', text: mem.recentEvents.join(' ') },
+            { id: 'openLoops', label: 'Memoria · pontas abertas', text: mem.openLoops.map(loop => loop.description).join(' ') },
+        ];
+        for (const block of memoryBlocks) {
+            if (containsTrackedTerm(block.text, terms, entry.tracking)) {
+                hits.push({ sourceType: 'memory', sourceId: block.id, label: block.label, excerpt: truncateText(block.text, 180) });
+            }
+        }
+    }
+
+    return hits;
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // PUBLIC API
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1043,6 +1621,7 @@ export const createNewUniverse = async (idea: UniverseIdea): Promise<Universe> =
     const newUniverse: Universe = {
         id: generateId(),
         name: idea.name,
+        subtitle: '',
         description: idea.description,
         lastGenerated: new Date().toISOString(),
         codex: {
@@ -1055,14 +1634,16 @@ export const createNewUniverse = async (idea: UniverseIdea): Promise<Universe> =
         chapters: [],
         assets: { visual: [], sound: [] },
         storyProfile: idea.profile,
+        notesPrivate: '',
+        syncMeta: ensureSyncMeta(),
     };
 
     const profileCtx = buildProfileContext(idea.profile);
     const hasPremiseCNU = !!(idea.profile?.premise?.trim());
     const factionSeedCNU = !hasPremiseCNU ? pickFactionArchetypes(2).map(h => `- ${h}`).join('\n') : '';
     const data = await chatJson<{
-        factions?: Array<{ title: string; content: string }>;
-        rules?: Array<{ title: string; content: string }>;
+        factions?: Array<{ title: string; content: string; belief?: string; myth?: string }>;
+        rules?: Array<{ title: string; content: string; belief?: string; myth?: string }>;
     }>({
         user: `
         ${profileCtx}
@@ -1070,8 +1651,8 @@ export const createNewUniverse = async (idea: UniverseIdea): Promise<Universe> =
         ${factionSeedCNU ? `FACTION STRUCTURE SEED (use these power structures — invent your own proper names, do NOT use these descriptions verbatim):\n${factionSeedCNU}` : 'PREMISE LOCK: Factions and rules MUST derive from the user premise above. Literary influences shape style, not content.'}
         Return only valid JSON with this exact shape:
         {
-          "factions": [{ "title": "Faction name (invented proper noun, not genre label)", "content": "What the faction controls + what it structurally needs + who it structurally conflicts with (competing needs for the same resource — not moral opposition)" }],
-          "rules": [{ "title": "Rule name", "content": "The rule + its primary social cost: who suffers from it, who exploits it, what injustice it creates or normalizes" }]
+          "factions": [{ "title": "Faction name (invented proper noun, not genre label)", "content": "What the faction controls + what it structurally needs + who it structurally conflicts with (competing needs for the same resource — not moral opposition)", "belief": "Optional: what insiders or victims believe about this faction", "myth": "Optional: what the city, culture, or rivals say about this faction" }],
+          "rules": [{ "title": "Rule name", "content": "The rule + its primary social cost: who suffers from it, who exploits it, what injustice it creates or normalizes", "belief": "Optional: what people incorrectly or emotionally believe about this rule", "myth": "Optional: the folklore, propaganda, or public version of this rule" }]
         }
         `,
         fallback: {},
@@ -1079,10 +1660,20 @@ export const createNewUniverse = async (idea: UniverseIdea): Promise<Universe> =
         maxTokens: 400,
     });
 
-    if (data.factions) newUniverse.codex.factions = data.factions.map((f) => ({ id: generateId(), ...f }));
-    if (data.rules) newUniverse.codex.rules = data.rules.map((r) => ({ id: generateId(), ...r }));
+    if (data.factions) newUniverse.codex.factions = data.factions.map((f) => ensureCodexEntryDefaults({
+        id: generateId(),
+        title: f.title,
+        content: f.content,
+        truth: createLayeredTruthBundle(`faction:${normalizeTitle(f.title)}`, f.content, { belief: f.belief, myth: f.myth }),
+    }));
+    if (data.rules) newUniverse.codex.rules = data.rules.map((r) => ensureCodexEntryDefaults({
+        id: generateId(),
+        title: r.title,
+        content: r.content,
+        truth: createLayeredTruthBundle(`rule:${normalizeTitle(r.title)}`, r.content, { belief: r.belief, myth: r.myth }),
+    }));
 
-    return newUniverse;
+    return ensureUniverseDefaults(newUniverse);
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1130,8 +1721,12 @@ export const generateFullUniverseGenesis = async (
         description?: string;
         overview?: string;
         setting?: string;
+        settingBelief?: string;
+        settingMyth?: string;
         conflict?: string;
-        factions?: Array<{ title: string; content: string }>;
+        conflictBelief?: string;
+        conflictMyth?: string;
+        factions?: Array<{ title: string; content: string; belief?: string; myth?: string }>;
     }>({        system: architectPrompt,
         user: isGenesisFromProfile
           ? effectiveLang === 'en' ? `
@@ -1152,7 +1747,11 @@ export const generateFullUniverseGenesis = async (
           "overview": "One paragraph setting atmosphere and central tension",
           "setting": "Specific location where Chapter 1 takes place",
           "conflict": "The inciting tension or threat driving the opening",
-          "factions": [{ "title": "Faction name (invented proper noun, not a genre label)", "content": "What the faction controls + what it structurally needs + who it structurally conflicts with (competing needs, not moral opposition)" }]
+          "factions": [{ "title": "Faction name (invented proper noun, not a genre label)", "content": "What the faction controls + what it structurally needs + who it structurally conflicts with (competing needs, not moral opposition)", "belief": "Optional: what insiders or nearby characters believe about this faction", "myth": "Optional: the city's rumor, propaganda, or sacred story about this faction" }],
+          "settingBelief": "Optional: what locals believe or fear about the opening location",
+          "settingMyth": "Optional: the folklore or public narrative surrounding the opening location",
+          "conflictBelief": "Optional: how characters misread or emotionally frame the opening conflict",
+          "conflictMyth": "Optional: the official, ritual, or cultural version of the opening conflict"
         }
         ${factionSeed ? `FACTION STRUCTURE SEED (use these power structures — invent proper names, do NOT copy verbatim):\n${factionSeed}\n        Generate 2-3 factions in structural tension. Avoid protagonist’s side vs antagonist’s side framing.` : 'Generate 2-3 factions that emerge from the user premise. Factions must compete for the specific resources or power the premise makes relevant.'}
         ` : `
@@ -1173,7 +1772,11 @@ export const generateFullUniverseGenesis = async (
           "overview": "Um parágrafo definindo atmosfera e tensão central",
           "setting": "Local específico onde o Capítulo 1 acontece",
           "conflict": "A tensão incitante ou ameaça que impulsiona a abertura",
-          "factions": [{ "title": "Nome da facção (substantivo próprio inventado, não rótulo de gênero)", "content": "O que a facção controla + o que ela estruturalmente precisa + com quem conflita (necessidades concorrentes, não oposição moral)" }]
+          "factions": [{ "title": "Nome da facção (substantivo próprio inventado, não rótulo de gênero)", "content": "O que a facção controla + o que ela estruturalmente precisa + com quem conflita (necessidades concorrentes, não oposição moral)", "belief": "Opcional: o que membros ou vítimas acreditam sobre esta facção", "myth": "Opcional: o rumor, propaganda ou narrativa sagrada sobre esta facção" }],
+          "settingBelief": "Opcional: o que os locais acreditam ou temem sobre o cenário inicial",
+          "settingMyth": "Opcional: o folclore ou narrativa pública sobre o cenário inicial",
+          "conflictBelief": "Opcional: como os personagens interpretam errado ou emocionalmente o conflito inicial",
+          "conflictMyth": "Opcional: a versão oficial, ritual ou cultural do conflito inicial"
         }
         ${factionSeed ? `FACTION STRUCTURE SEED (use estas estruturas de poder — invente nomes próprios, NÃO copie verbatim):\n${factionSeed}\n        Gere 2-3 facções em tensão estrutural.` : 'Gere 2-3 facções que emergem da premissa do usuário. As facções devem competir pelos recursos específicos relevantes à premissa.'}
         `
@@ -1189,7 +1792,11 @@ export const generateFullUniverseGenesis = async (
           "overview": "One paragraph that sets the atmosphere and central tension",
           "setting": "The specific location where Chapter 1 will take place",
           "conflict": "The inciting tension or threat that drives the opening",
-          "factions": [{ "title": "Faction name (invented proper noun, not a genre label)", "content": "What the faction controls + what it structurally needs + who it structurally conflicts with (competing needs, not moral opposition)" }]
+          "factions": [{ "title": "Faction name (invented proper noun, not a genre label)", "content": "What the faction controls + what it structurally needs + who it structurally conflicts with (competing needs, not moral opposition)", "belief": "Optional: what insiders or nearby characters believe about this faction", "myth": "Optional: the city's rumor, propaganda, or sacred story about this faction" }],
+          "settingBelief": "Optional: what locals believe or fear about the opening location",
+          "settingMyth": "Optional: the folklore or public narrative surrounding the opening location",
+          "conflictBelief": "Optional: how characters misread or emotionally frame the opening conflict",
+          "conflictMyth": "Optional: the official, ritual, or cultural version of the opening conflict"
         }
         ${factionSeed ? `FACTION STRUCTURE SEED (use these power structures — invent proper names, do NOT copy verbatim):\n${factionSeed}\n        Generate 2-3 factions in structural tension. Avoid protagonist’s side vs antagonist’s side framing.` : 'Generate 2-3 factions that emerge from the user premise. Factions must compete for the specific resources or power the premise makes relevant.'}
         ` : `
@@ -1204,7 +1811,11 @@ export const generateFullUniverseGenesis = async (
           "overview": "Um parágrafo que define a atmosfera e a tensão central",
           "setting": "O local específico onde o Capítulo 1 acontecerá",
           "conflict": "A tensão incitante ou ameaça que impulsiona a abertura",
-          "factions": [{ "title": "Nome da facção (substantivo próprio inventado, não rótulo de gênero)", "content": "O que a facção controla + o que ela estruturalmente precisa + com quem conflita (necessidades concorrentes, não oposição moral)" }]
+          "factions": [{ "title": "Nome da facção (substantivo próprio inventado, não rótulo de gênero)", "content": "O que a facção controla + o que ela estruturalmente precisa + com quem conflita (necessidades concorrentes, não oposição moral)", "belief": "Opcional: o que membros ou vítimas acreditam sobre esta facção", "myth": "Opcional: o rumor, propaganda ou narrativa sagrada sobre esta facção" }],
+          "settingBelief": "Opcional: o que os locais acreditam ou temem sobre o cenário inicial",
+          "settingMyth": "Opcional: o folclore ou narrativa pública sobre o cenário inicial",
+          "conflictBelief": "Opcional: como os personagens interpretam errado ou emocionalmente o conflito inicial",
+          "conflictMyth": "Opcional: a versão oficial, ritual ou cultural do conflito inicial"
         }
         ${factionSeed ? `FACTION STRUCTURE SEED (use estas estruturas de poder — invente nomes próprios, NÃO copie verbatim):\n${factionSeed}\n        Gere 2-3 facções em tensão estrutural.` : 'Gere 2-3 facções que emergem da premissa do usuário. As facções devem competir pelos recursos específicos relevantes à premissa.'}
         `,
@@ -1222,13 +1833,32 @@ export const generateFullUniverseGenesis = async (
     emitAgentOutput({ agent: 'architect', label: stepLabel, status: 'done', summary: anchorData.overview?.slice(0, 120) || (anchorData.name ?? 'Âncoras criadas'), detail: JSON.stringify(anchorData, null, 2) });
 
     uni.codex.overview = anchorData.overview || uni.codex.overview;
-    uni.codex.factions = (anchorData.factions || []).map(x => ({ id: generateId(), ...x }));
+    uni.codex.factions = (anchorData.factions || []).map(x => ensureCodexEntryDefaults({
+        id: generateId(),
+        title: x.title,
+        content: x.content,
+        truth: createLayeredTruthBundle(`faction:${normalizeTitle(x.title)}`, x.content, { belief: x.belief, myth: x.myth }),
+    }));
 
     if (anchorData.setting) {
-        uni.codex.rules.push({ id: generateId(), title: 'Initial Setting', content: anchorData.setting });
+        uni.codex.rules.push(ensureCodexEntryDefaults({
+            id: generateId(),
+            title: 'Initial Setting',
+            content: anchorData.setting,
+            aliases: ['Abertura', 'Cenario inicial'],
+            aiVisibility: 'global',
+            truth: createLayeredTruthBundle('rule:initial-setting', anchorData.setting, { belief: anchorData.settingBelief, myth: anchorData.settingMyth }),
+        }));
     }
     if (anchorData.conflict) {
-        uni.codex.rules.push({ id: generateId(), title: 'Central Conflict', content: anchorData.conflict });
+        uni.codex.rules.push(ensureCodexEntryDefaults({
+            id: generateId(),
+            title: 'Central Conflict',
+            content: anchorData.conflict,
+            aliases: ['Conflito central'],
+            aiVisibility: 'global',
+            truth: createLayeredTruthBundle('rule:central-conflict', anchorData.conflict, { belief: anchorData.conflictBelief, myth: anchorData.conflictMyth }),
+        }));
     }
 
     // ── Step 2: Protagonist seed (one Soulforger call) ──
@@ -1238,6 +1868,7 @@ export const generateFullUniverseGenesis = async (
     const factionsList = uni.codex.factions.map(f => f.title).join(', ') || 'Independent';
     const protData = await chatJson<{
         name?: string;
+        aliases?: string[];
         role?: Character['role'];
         faction?: string;
         bio?: string;
@@ -1258,6 +1889,7 @@ export const generateFullUniverseGenesis = async (
         Return only valid JSON:
         {
           "name": "Name",
+          "aliases": ["Nickname or in-world title"],
           "role": "Protagonista",
           "faction": "Faction name",
           "bio": "2-sentence biography including Ghost and Lie",
@@ -1277,6 +1909,7 @@ export const generateFullUniverseGenesis = async (
         Retorne apenas JSON válido:
         {
           "name": "Nome",
+          "aliases": ["Apelido ou titulo usado no mundo"],
           "role": "Protagonista",
           "faction": "Nome da facção",
           "bio": "Biografia de 2 frases incluindo Ghost e Lie",
@@ -1298,12 +1931,18 @@ export const generateFullUniverseGenesis = async (
     const protagonist: Character = {
         id: generateId(),
         name: protName,
+        aliases: normalizeAliasList(protData.aliases),
         role: protData.role || 'Protagonista',
         faction: protData.faction || factionsList.split(',')[0] || 'Unknown',
         age: protData.age || 25,
         alignment: protData.alignment || 'N/A',
         bio: protData.bio || (effectiveLang === 'en' ? 'A mysterious figure.' : 'Uma figura misteriosa.'),
+        ghost: protData.ghost,
+        coreLie: protData.lie,
         status: 'Vivo',
+        notesPrivate: '',
+        aiVisibility: 'global',
+        tracking: { ...DEFAULT_TRACKING },
         relationships: [],
         chapters: [],
         imageUrl: createPortraitUrl({
@@ -1322,25 +1961,25 @@ export const generateFullUniverseGenesis = async (
     // Extract just the place name (before the first comma or dash) to avoid verbose beats
     const setting = rawSetting.split(/[,\-—]/)[0].trim();
     const genesisScenes = effectiveLang === 'en' ? [
-        { beat: `${protagonist.name} goes through their daily routine at ${setting} — show what they do, who they're with, what they value.`, characters: [protagonist.name], tension: 'rising' },
-        { beat: `A trivial interaction or object triggers a memory of the Ghost (${protData.ghost || 'hidden past pain'}), revealed through physical action, no flashback or exposition.`, characters: [protagonist.name], tension: 'rising' },
-        { beat: `${protagonist.name} faces a concrete obstacle that exposes the Lie (${protData.lie || 'their distorted worldview'}).`, characters: [protagonist.name], tension: 'rising' },
-        { beat: `The inciting incident erupts: an external event destroys the status quo and forces ${protagonist.name} to act immediately.`, characters: [protagonist.name], tension: 'peak' },
-        { beat: `${protagonist.name} makes a first irreversible decision that commits them to the central conflict — no turning back.`, characters: [protagonist.name], tension: 'peak' },
+        { beat: `${protagonist.name} works through a concrete task at ${setting} when a detail in the environment proves one of their protections has been disturbed.`, characters: [protagonist.name], tension: 'rising' },
+        { beat: `${protagonist.name} tests the disturbance with their own body or tools, and the contact forces a live physical echo of the Ghost without slipping into flashback summary.`, characters: [protagonist.name], tension: 'rising' },
+        { beat: `A messenger, witness, customer, or intruder arrives carrying evidence that turns the world conflict into a personal threat for ${protagonist.name}.`, characters: [protagonist.name], tension: 'rising' },
+        { beat: `${protagonist.name} extracts or recognizes one hard fact that reveals the threat was aimed at them specifically, not at random.`, characters: [protagonist.name], tension: 'peak' },
+        { beat: `${protagonist.name} chooses an immediate course of action that burns a bridge, marks an enemy, or exposes them to retaliation.`, characters: [protagonist.name], tension: 'peak' },
     ] : [
-        { beat: `${protagonist.name} executa sua rotina em ${setting} — mostrar o que faz, com quem convive, o que valoriza.`, characters: [protagonist.name], tension: 'rising' },
-        { beat: `Uma interação ou objeto trivial do cotidiano desencadeia uma memória do Ghost (${protData.ghost || 'dor do passado'}), revelada em ação física, sem flashback ou exposição.`, characters: [protagonist.name], tension: 'rising' },
-        { beat: `${protagonist.name} enfrenta um obstáculo concreto que expõe o conflito do Lie (${protData.lie || 'sua visão distorcida do mundo'}).`, characters: [protagonist.name], tension: 'rising' },
-        { beat: `O incidente incitante explode: um evento externo destrói o status quo e força ${protagonist.name} a agir imediatamente.`, characters: [protagonist.name], tension: 'peak' },
-        { beat: `${protagonist.name} toma uma primeira decisão que o compromete com o conflito central — não pode mais voltar atrás.`, characters: [protagonist.name], tension: 'peak' },
+        { beat: `${protagonist.name} trabalha em uma tarefa concreta em ${setting} quando um detalhe do ambiente prova que uma de suas proteções foi violada.`, characters: [protagonist.name], tension: 'rising' },
+        { beat: `${protagonist.name} testa a violação com o próprio corpo ou com suas ferramentas, e o contato força um eco físico do Ghost sem cair em flashback resumido.`, characters: [protagonist.name], tension: 'rising' },
+        { beat: `Um mensageiro, testemunha, cliente ou intruso chega carregando uma evidência que transforma o conflito do mundo em ameaça pessoal para ${protagonist.name}.`, characters: [protagonist.name], tension: 'rising' },
+        { beat: `${protagonist.name} extrai ou reconhece um fato duro que revela que a ameaça foi armada especificamente para atingi-lo, e não ao acaso.`, characters: [protagonist.name], tension: 'peak' },
+        { beat: `${protagonist.name} escolhe uma ação imediata que queima uma ponte, marca um inimigo ou o expõe a represália direta.`, characters: [protagonist.name], tension: 'peak' },
     ];
 
     const chapterTitle = effectiveLang === 'en' ? 'The Beginning' : 'O Começo';
     const chapterParams: ChapterGenerationParams = {
         title: chapterTitle,
         plotDirection: effectiveLang === 'en'
-            ? `Introduce ${protagonist.name} in their everyday world at ${setting}. Show their Ghost (${protData.ghost || 'hidden pain'}) through action, not exposition. Build to the inciting incident. End with an irreversible commitment.`
-            : `Apresente ${protagonist.name} no seu mundo cotidiano em ${setting}. Mostre o Ghost (${protData.ghost || 'dor oculta'}) através de ação, não exposição. Construa até o incidente incitante. Termine com um compromisso irreversível.`,
+            ? `Open with a concrete task at ${setting}, let the Ghost (${protData.ghost || 'hidden pain'}) break through physical contact, then turn the world conflict into a targeted personal threat. End with a retaliatory choice.`
+            : `Abra com uma tarefa concreta em ${setting}, deixe o Ghost (${protData.ghost || 'dor oculta'}) romper por contato físico, depois transforme o conflito do mundo em uma ameaça pessoal direcionada. Termine com uma escolha de retaliação.`,
         activeCharacterIds: [protagonist.id],
         tone: idea.profile?.tone ?? 'Dramático',
         focus: 'Introspecção',
@@ -1369,7 +2008,7 @@ export const generateFullUniverseGenesis = async (
     }
 
     onProgress('done');
-    return uni;
+    return ensureUniverseDefaults(uni);
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1391,6 +2030,8 @@ interface ChroniclerOutput {
         wordOveruse?: string[];
         sceneObjectiveCheck?: string;
         passiveProtagonist?: string;
+        rhetoricalPatternOveruse?: string;
+        rhetoricalPatternCount?: number;
     };
 }
 
@@ -1461,6 +2102,8 @@ interface SurgicalLectorOutput {
     wordOveruse: string[];
     passiveProtagonist: 'sim' | 'não';
     sceneObjectiveCheck: 'ok' | 'complicado' | 'falhou';
+    rhetoricalPatternOveruse?: string;
+    rhetoricalPatternCount?: number;
 }
 
 const generateChapterThreePass = async (
@@ -1469,7 +2112,8 @@ const generateChapterThreePass = async (
 ): Promise<ThreePassResult> => {
     const compactMode = isEconomyMode(params.qualityMode);
     const memoryCtx = buildMemoryContext(universe, params.chapterIndex, compactMode);
-    const worldContext = buildUniverseContext(universe, compactMode ? { compact: true, maxFactions: 2, maxRules: 4, maxTimeline: 2 } : undefined);
+    const relatedEntityIds = deriveContextEntityIds(universe, params.activeCharacterIds);
+    const worldContext = buildUniverseContext(universe, compactMode ? { compact: true, maxFactions: 2, maxRules: 4, maxTimeline: 3, relatedEntityIds } : { relatedEntityIds });
     const characterContext = buildCharacterContext(universe, params.activeCharacterIds, compactMode);
     const profileCtx = buildProfileContext(universe.storyProfile, compactMode);
     const langMandateText = langMandate(params.lang ?? universe.lang ?? 'pt');
@@ -1540,6 +2184,10 @@ STATE-CHANGE RULE (Every scene must advance the plot):
 - If the characters are in the same place, same condition, with the same knowledge at the end of a scene as at the beginning, the scene is INVALID — rewrite it.
 - FORBIDDEN: scenes where characters only "discuss what to do" or "reflect on events". Characters must ACT while they talk.
 - Use THEREFORE/BUT causality: each beat connects to the next via consequence or complication. Never coincidence.
+- FORBIDDEN BEAT SHAPES: "show routine", "memory of the ghost", "obstacle exposes the lie", "inciting incident erupts", "irreversible decision" as abstract labels.
+- Instead, beats must name the concrete event itself: object, attack, revelation, pursuit, exchange, wound, intrusion, theft, argument, omen, discovery.
+- Every beat must feel unique to THIS world and THIS chapter. If the beat could fit any fantasy story, it is too generic.
+- Across the full plan, vary beat temperature: not every scene should peak. Mix pressure, investigation, movement, reversal, and fallout.
 
 Output a structured plan — do NOT write prose.
 CONCISION MANDATE: Each "beat" must be ONE specific sentence (10-25 words) naming WHO does WHAT WHERE. Not vague labels.`,
@@ -1794,6 +2442,9 @@ ${nameVariationMandate}
 - LONG (15–35 words, subordinate clauses): environment, interiority, consequence. Immersion.
 - Example: "A porta cedeu. O cheiro de enxofre que veio com ela era antigo demais para ser descuido — alguém havia preparado aquela sala antes de ${protagonistFirstName} sequer saber que viria."
 - Action sequences: bias short. Reflective or environmental passages: bias long. Never monotone.
+- TEMPERATURE RULE: not every sentence should sound monumental. Most sentences should carry story clearly; only a few should try to be unforgettable.
+- After any high-intensity image or gothic line, ground the next beat in plain physical reality: movement, object, breath, wound, sound, distance, weight.
+- If three consecutive sentences all sound aphoristic, solemn, or "trailer-like", rewrite them into cleaner narrative prose.
 
 === SENSORY PALETTE — BEYOND VISION ===
 - Each scene MUST use at least 2 senses that are NOT vision. Vision is the default — it is not enough alone.
@@ -1809,6 +2460,19 @@ ${nameVariationMandate}
 - PERSONIFICATION (give agency to objects): "A luz da vela lutava contra a escuridão."
 - ANAPHORA (repeated opening for rhythm — MAX ONCE per chapter): "Era preciso coragem. Era preciso lógica. Era preciso silêncio."
 - RULE: if a device calls attention to itself, it has already failed. Good craft is invisible.
+
+=== RHETORICAL CRUTCH BAN — MANDATORY ===
+- Do NOT lean on contrastive-negation sentence molds as a default literary tic.
+- FORBIDDEN high-frequency patterns: "não X, mas Y", "não era..., mas...", "não por..., mas por...", "em vez disso", "not X, but Y", "it wasn't..., it was...".
+- You may use one isolated contrastive sentence if absolutely necessary, but repeated use in the same chapter is a failure.
+- When you want contrast, do it through sequence and consequence:
+  • action followed by reaction
+  • image followed by image
+  • expectation broken by a concrete event
+- Bad: "Ele sorriu, não por alegria, mas por hábito."
+- Better: "O canto da boca subiu por reflexo. Os olhos ficaram imóveis."
+- ALSO FORBIDDEN: chains of negation used to simulate profundity, such as "não humana. não animal.", "não era linguagem. era ritual.", "não por medo. por certeza."
+- Default to affirmative syntax. Name what is there before naming what it is not.
 
 === LENGTH MANDATE & MICRO-PACING ===
 - Write ALL ${plan.scenes?.length || 5} beats fully — do not summarize or skip any.
@@ -1919,6 +2583,8 @@ CRITICAL REVISION TASK: Expand the chapter below so it fully dramatizes every pl
 RULES:
 - Return MAX 8 replacements. Each "find" must be an EXACT verbatim phrase from the text (10-60 chars).
 - Only flag issues that are CLEARLY present: word overuse (same non-article word 4+ times), POV drift, passive protagonist.
+- Detect rhetorical crutches: repeated contrastive-negation molds such as "não X, mas Y", "não era..., mas...", "em vez disso", "not X, but Y".
+- Detect tonal monotony: if too many consecutive sentences sound maximally solemn, aphoristic, or trailer-like, prefer cleaner and more direct replacements.
 - Do NOT alter plot, names, or story facts.
 - Do NOT return a replacement if you are not 100% sure the "find" string appears verbatim.
 - "sceneObjectiveCheck": "ok" if the protagonist actively drives each scene, "complicado" if they are passive in 1-2 scenes, "falhou" if passive throughout.`,
@@ -1937,7 +2603,9 @@ Return ONLY valid JSON matching this exact schema:
   ],
   "wordOveruse": ["word1", "word2"],
   "passiveProtagonist": "sim" | "não",
-  "sceneObjectiveCheck": "ok" | "complicado" | "falhou"
+  "sceneObjectiveCheck": "ok" | "complicado" | "falhou",
+  "rhetoricalPatternOveruse": "short warning message if contrastive-negation rhetoric is overused",
+  "rhetoricalPatternCount": 0
 }`,
         fallback: { replacements: [], wordOveruse: [], passiveProtagonist: 'não', sceneObjectiveCheck: 'ok' },
         temperature: 0.2,
@@ -1947,17 +2615,52 @@ Return ONLY valid JSON matching this exact schema:
         schema: ZSurgicalLectorOutput as z.ZodType<SurgicalLectorOutput>,
     });
     lectorAudit = lectorResult;
+    const rhetoricalAudit = countContrastiveNegationPatterns(proseSample);
+    lectorAudit = {
+        ...lectorAudit,
+        rhetoricalPatternCount: Math.max(lectorAudit.rhetoricalPatternCount ?? 0, rhetoricalAudit.count),
+        rhetoricalPatternOveruse: lectorAudit.rhetoricalPatternOveruse || rhetoricalAudit.message || '',
+    };
 
     // Apply surgical replacements to the full prose
     finalProse = applyLectorReplacements(prose, lectorAudit.replacements ?? []);
     // Safety: if result shrank dramatically, fall back to original
     if (finalProse.length < prose.length * 0.92) finalProse = prose;
+    if ((lectorAudit.rhetoricalPatternCount ?? 0) >= 3 && !compactMode) {
+        emitAgentOutput({ agent: 'bard', label: 'Bard rhetorical rewrite', status: 'thinking' });
+        let rewrittenProse = await chat({
+            system: bardPrompt,
+            user: `${langMandateText}
+
+The Lector flagged heavy overuse of contrastive-negation rhetoric in the chapter below.
+
+=== RHETORICAL REWRITE MANDATE ===
+- Remove habitual formulas such as "não X, mas Y", "não era..., mas...", "em vez disso", "não com..., mas com...".
+- Rewrite toward direct statement, direct image, direct action, sensory detail, or consequence.
+- Preserve plot, scene order, character decisions, and ending.
+- Keep the prose dense and literary, but stop self-correcting sentences.
+- Return the FULL rewritten chapter.
+
+CHAPTER TO FIX:
+${finalProse}`,
+            json: false,
+            temperature: 0.7,
+            maxTokens: 5200,
+            label: 'Bard rhetorical rewrite',
+        });
+        rewrittenProse = stripLLMPrefixes(rewrittenProse);
+        rewrittenProse = cleanLanguageLeakage(rewrittenProse, params.lang ?? universe.lang ?? 'pt');
+        if (rewrittenProse.length > finalProse.length * 0.72) {
+            finalProse = rewrittenProse;
+        }
+    }
 
     const lectorSummary = [
         `${lectorAudit.replacements?.length ?? 0} correções`,
         lectorAudit.passiveProtagonist === 'sim' ? '⚠ protagonista passivo' : null,
         lectorAudit.sceneObjectiveCheck !== 'ok' ? `cenas: ${lectorAudit.sceneObjectiveCheck}` : null,
         lectorAudit.wordOveruse?.length ? `overuse: ${lectorAudit.wordOveruse.join(', ')}` : null,
+        lectorAudit.rhetoricalPatternCount && lectorAudit.rhetoricalPatternCount >= 3 ? `retÃ³rica IA: ${lectorAudit.rhetoricalPatternCount}` : null,
     ].filter(Boolean).join(' · ');
 
     emitAgentOutput({
@@ -2196,6 +2899,8 @@ For each character update, also note any relationships that are revealed or chan
             wordOveruse: mergedWordOveruse.length > 0 ? mergedWordOveruse : undefined,
             passiveProtagonist: worstPassive,
             sceneObjectiveCheck: worseSco,
+            rhetoricalPatternOveruse: lectorAudit.rhetoricalPatternOveruse || safeChronicler.auditFlags?.rhetoricalPatternOveruse,
+            rhetoricalPatternCount: Math.max(lectorAudit.rhetoricalPatternCount ?? 0, safeChronicler.auditFlags?.rhetoricalPatternCount ?? 0),
         };
     }
 
@@ -2220,16 +2925,22 @@ export const generateChapterWithAgents = async (
     universe: Universe,
     params: ChapterGenerationParams,
 ): Promise<{ chapter: Chapter; updatedUniverse: Universe }> => {
-    const { chapter, chroniclerOutput } = await generateChapterThreePass(universe, params);
+    const preparedUniverse = params.directorPrepared
+        ? universe
+        : await prepareUniverseForManualDirection(universe, params.qualityMode);
+    const { chapter, chroniclerOutput } = await generateChapterThreePass(preparedUniverse, {
+        ...params,
+        directorPrepared: true,
+    });
 
     // Build a new universe object — no direct React state mutation
-    const idx = params.chapterIndex ?? universe.chapters.length;
+    const idx = params.chapterIndex ?? preparedUniverse.chapters.length;
     const updatedChapters = [
-        ...universe.chapters.slice(0, idx),
+        ...preparedUniverse.chapters.slice(0, idx),
         chapter,
-        ...universe.chapters.slice(idx),
+        ...preparedUniverse.chapters.slice(idx),
     ];
-    let updatedUniverse: Universe = { ...universe, chapters: updatedChapters };
+    let updatedUniverse: Universe = { ...preparedUniverse, chapters: updatedChapters };
 
     if (chroniclerOutput) {
         updatedUniverse = applyChroniclerSideEffects(updatedUniverse, chroniclerOutput, idx, chapter.id);
@@ -2252,10 +2963,13 @@ const generateDirectorGuidance = async (
     const langMandateText = langMandate(effectiveLang);
     const mem = universe.narrativeMemory;
     const protagonist = universe.characters[0];
+    const protagonistLie = protagonist?.coreLie?.trim() || '';
+    const prevLieState = mem?.lieStates?.find(state => state.characterId === protagonist?.id);
 
     const openLoops = mem?.openLoops.filter(l => l.resolved === undefined) ?? [];
     const recentEvents = mem?.recentEvents ?? [];
     const factions = universe.codex.factions.map(f => f.title).join(', ') || 'none';
+    const activeTimelinePressure = universe.codex.timeline.filter(entry => entry.eventState === 'active_pressure').slice(0, 4);
     // Words already on cooldown — pass them so Director can avoid re-adding them
     const currentChIdx = universe.chapters.length;
     const activeCooldownWords = Object.entries(mem?.lexicalCooldown ?? {})
@@ -2273,10 +2987,20 @@ const generateDirectorGuidance = async (
             ? 'CRITICAL: protagonist was passive last chapter — must initiate a decisive physical action this chapter'
             : 'Protagonist agency is healthy — deepen their internal contradiction',
         thematicConstraint: 'The central conflict must bear down on every scene — no relief without cost',
-        narrativePressure: openLoops.length > 5
+        narrativePressure: activeTimelinePressure[0]
+            ? `Active timeline pressure: ${activeTimelinePressure[0].title} must dictate the rhythm and urgency of the next chapter`
+            : openLoops.length > 5
             ? `Pressure cooker: ${openLoops.length} unresolved loops — at least one must crack this chapter`
             : 'Raise the stakes on the central tension with a concrete, irreversible consequence',
         wordsToSetOnCooldown: newOveruse,
+        cooldownSubstitutions: newOveruse.slice(0, 5).map(word => ({
+            term: word,
+            note: `Do not use "${word}". Replace it with sensory description, metaphor, or consequence.`,
+        })),
+        contradictionSummary: protagonist?.coreLie ? `Track contradictions against the protagonist lie: ${protagonist.coreLie}` : 'No protagonist lie registered.',
+        liePressureSource: 'escalation',
+        protagonistLieStability: mem?.lieStates?.find(state => state.characterId === protagonist?.id)?.lieStability ?? 10,
+        ruptureRequired: (mem?.lieStates?.find(state => state.characterId === protagonist?.id)?.lieStability ?? 10) <= 3,
     };
 
     const guidance = await chatJson<DirectorGuidance>({
@@ -2286,6 +3010,10 @@ const generateDirectorGuidance = async (
 UNIVERSE: "${universe.name}" — ${universe.codex.overview}
 FACTIONS: ${factions}
 PROTAGONIST: ${protagonist?.name || 'Unknown'} — ${protagonist?.bio?.slice(0, 150) || 'no bio'}
+PROTAGONIST CORE LIE: ${protagonistLie || 'none recorded'}
+PREVIOUS LIE STABILITY: ${prevLieState?.lieStability ?? 10}/10
+PREVIOUS LIE PRESSURE: ${prevLieState?.pressureSources.join(', ') || 'none'}
+PREVIOUS CONTRADICTIONS: ${prevLieState?.contradictions.slice(-3).join(' | ') || 'none'}
 CHAPTERS WRITTEN SO FAR: ${universe.chapters.length}
 
 NARRATIVE MEMORY STATE:
@@ -2297,6 +3025,11 @@ Previous Audit Flags:
   - Scene check: ${mem?.lastAuditFlags?.sceneObjectiveCheck || 'ok'}
   - Overused words last chapter: ${newOveruse.join(', ') || 'none'}
   - Currently on cooldown: ${activeCooldownWords.join(', ') || 'none'}
+  - Contrastive-negation crutch count: ${mem?.lastAuditFlags?.rhetoricalPatternCount ?? 0}
+  - Contrastive-negation warning: ${mem?.lastAuditFlags?.rhetoricalPatternOveruse || 'none'}
+
+Active Timeline Pressures:
+${activeTimelinePressure.map(entry => `- ${entry.title}: ${entry.content}`).join('\n') || '- none'}
 
 Return ONLY valid JSON:
 {
@@ -2306,6 +3039,11 @@ Return ONLY valid JSON:
   "characterFocus": "What the protagonist must actively confront or decide — a character action, not an emotion",
   "thematicConstraint": "One sentence: what thematic cost or question must press against every scene this chapter",
   "narrativePressure": "The GM-level tension to inject — a pressure on the world, not a prescribed action (e.g. 'Someone is about to betray trust')",
+  "cooldownSubstitutions": [{ "term": "mirror", "note": "Do not name it directly; use sensory description, metaphor, action, or consequence instead." }],
+  "contradictionSummary": "What fresh evidence or event now attacks the protagonist core lie",
+  "liePressureSource": "betrayal | guilt | factual proof | failure | revelation | escalation",
+  "protagonistLieStability": 7,
+  "ruptureRequired": false,
   "wordsToSetOnCooldown": ${JSON.stringify(newOveruse.slice(0, 10))}
 }`,
         fallback,
@@ -2330,6 +3068,101 @@ Return ONLY valid JSON:
     });
 
     return guidance;
+};
+
+const applyDirectorGuidance = (
+    universe: Universe,
+    directorGuidance: DirectorGuidance,
+): Universe => {
+    const chapterIdxNow = universe.chapters.length;
+    const prevCooldown = universe.narrativeMemory?.lexicalCooldown ?? {};
+    const prevCooldownGuidance = universe.narrativeMemory?.lexicalCooldownGuidance ?? {};
+    const updatedCooldown: Record<string, number> = {};
+    const updatedCooldownGuidance: Record<string, string> = {};
+
+    for (const [word, expiry] of Object.entries(prevCooldown)) {
+        if (expiry > chapterIdxNow) {
+            updatedCooldown[word] = expiry;
+            if (prevCooldownGuidance[word]) updatedCooldownGuidance[word] = prevCooldownGuidance[word];
+        }
+    }
+
+    for (const word of directorGuidance.wordsToSetOnCooldown ?? []) {
+        updatedCooldown[word.toLowerCase()] = chapterIdxNow + 2;
+    }
+    for (const substitution of directorGuidance.cooldownSubstitutions ?? []) {
+        if (!substitution.term?.trim()) continue;
+        updatedCooldownGuidance[substitution.term.toLowerCase()] = substitution.note;
+    }
+
+    const protagonist = universe.characters[0];
+    const prevLieStates = universe.narrativeMemory?.lieStates ?? [];
+    const nextLieStates = [...prevLieStates];
+    if (protagonist?.coreLie?.trim()) {
+        const idx = nextLieStates.findIndex(state => state.characterId === protagonist.id);
+        const baseState = idx >= 0
+            ? nextLieStates[idx]
+            : {
+                characterId: protagonist.id,
+                name: protagonist.name,
+                coreLie: protagonist.coreLie,
+                lieStability: 10,
+                pressureSources: [],
+                contradictions: [],
+                ruptureRequired: false,
+                lastUpdatedChapter: Math.max(0, chapterIdxNow - 1),
+            };
+        const contradictionSummary = directorGuidance.contradictionSummary?.trim();
+        const contradictions = contradictionSummary && contradictionSummary !== 'No protagonist lie registered.'
+            ? Array.from(new Set([...baseState.contradictions, contradictionSummary])).slice(-6)
+            : baseState.contradictions;
+        const pressureSource = directorGuidance.liePressureSource?.trim();
+        const pressureSources = pressureSource
+            ? Array.from(new Set([...baseState.pressureSources, pressureSource])).slice(-6)
+            : baseState.pressureSources;
+        const nextState: CharacterLieState = {
+            ...baseState,
+            name: protagonist.name,
+            coreLie: protagonist.coreLie,
+            lieStability: Math.max(1, Math.min(10, directorGuidance.protagonistLieStability ?? baseState.lieStability)),
+            pressureSources,
+            contradictions,
+            ruptureRequired: directorGuidance.ruptureRequired ?? baseState.ruptureRequired,
+            lastUpdatedChapter: chapterIdxNow,
+        };
+        if (idx >= 0) nextLieStates[idx] = nextState;
+        else nextLieStates.push(nextState);
+    }
+
+    return {
+        ...universe,
+        narrativeMemory: {
+            ...universe.narrativeMemory ?? {
+                lastChapterIndex: 0,
+                globalSummary: '',
+                characterStates: [],
+                openLoops: [],
+                recentEvents: [],
+                newCodexEntries: { factions: [], rules: [], timeline: [] },
+            },
+            directorGuidance,
+            lexicalCooldown: updatedCooldown,
+            lexicalCooldownGuidance: updatedCooldownGuidance,
+            lieStates: nextLieStates,
+        } as NarrativeMemory,
+    };
+};
+
+const prepareUniverseForManualDirection = async (
+    universe: Universe,
+    qualityMode?: GenerationQualityMode,
+): Promise<Universe> => {
+    const syncedUniverse = (universe.syncMeta?.dirtyScopes?.length ?? 0) > 0
+        ? syncUniverseCanon(universe, 'light')
+        : ensureUniverseDefaults(universe);
+    const compactMode = isEconomyMode(qualityMode);
+    const directorGuidance = await generateDirectorGuidance(syncedUniverse, compactMode);
+    return applyDirectorGuidance(syncedUniverse, directorGuidance);
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2362,42 +3195,13 @@ export const generateStoryArc = async (
         // ── Director — reads world state, issues per-chapter guidance ──
         onProgress({ chaptersDone: i, totalChapters, phase: 'director', currentUniverse: current });
         const directorGuidance = await generateDirectorGuidance(current, compactMode);
-
-        // Store director guidance in narrative memory so Weaver prompt can read it.
-        // Also update the lexical cooldown: add new words with a 2-chapter expiry,
-        // and purge words whose cooldown has already expired.
-        const chapterIdxNow = current.chapters.length;
-        const prevCooldown = current.narrativeMemory?.lexicalCooldown ?? {};
-        const updatedCooldown: Record<string, number> = {};
-        // Keep still-active entries
-        for (const [word, expiry] of Object.entries(prevCooldown)) {
-            if (expiry > chapterIdxNow) updatedCooldown[word] = expiry;
-        }
-        // Add newly flagged words with expiry = currentChapter + 2
-        for (const word of directorGuidance.wordsToSetOnCooldown ?? []) {
-            updatedCooldown[word.toLowerCase()] = chapterIdxNow + 2;
-        }
-
-        current = {
-            ...current,
-            narrativeMemory: {
-                ...current.narrativeMemory ?? {
-                    lastChapterIndex: 0,
-                    globalSummary: '',
-                    characterStates: [],
-                    openLoops: [],
-                    recentEvents: [],
-                    newCodexEntries: { factions: [], rules: [], timeline: [] },
-                },
-                directorGuidance,
-                lexicalCooldown: updatedCooldown,
-            } as NarrativeMemory,
-        };
+        current = applyDirectorGuidance(current, directorGuidance);
 
         onProgress({ chaptersDone: i, totalChapters, phase: 'weaver', currentUniverse: current });
 
         const { updatedUniverse } = await generateChapterWithAgents(current, {
             ...baseParams,
+            directorPrepared: true,
         });
         current = updatedUniverse;
 
@@ -2451,7 +3255,13 @@ const canonicalizeCharacterIdToken = (characterId?: string): string => {
 };
 
 const canonicalizeChroniclerOutput = (universe: Universe, output: ChroniclerOutput): ChroniclerOutput => {
-    const rosterByName = new Map(universe.characters.map(c => [normalizeTitle(c.name), c]));
+    const rosterByName = new Map<string, Character>();
+    for (const character of universe.characters) {
+        rosterByName.set(normalizeTitle(character.name), character);
+        for (const alias of character.aliases ?? []) {
+            rosterByName.set(normalizeTitle(alias), character);
+        }
+    }
     const protagonist = universe.characters[0];
     const dedupedStates = new Map<string, CharacterState>();
 
@@ -2505,7 +3315,7 @@ const applyChroniclerSideEffects = (
         },
     };
 
-    applyChroniclerOutput(updatedUniverse, output);
+    applyChroniclerOutput(updatedUniverse, output, chapterId);
     updateNarrativeMemoryFromChronicler(updatedUniverse, output, chapterIndex);
 
     const mentionedByName = new Set((output.characterUpdates || []).map(cu => normalizeTitle(cu.name)));
@@ -2529,6 +3339,7 @@ const applyChroniclerSideEffects = (
             newChars.push({
                 id: newId,
                 name: cu.name,
+                aliases: [],
                 imageUrl: '',
                 role: 'Figurante',
                 faction: '',
@@ -2536,6 +3347,9 @@ const applyChroniclerSideEffects = (
                 age: 0,
                 alignment: 'Unknown',
                 bio: `${cu.lastAction || ''} ${cu.emotionalState ? `— ${cu.emotionalState}` : ''}`.trim() || `Discovered in Chapter ${chapterIndex + 1}.`,
+                notesPrivate: '',
+                aiVisibility: DEFAULT_AI_VISIBILITY,
+                tracking: { ...DEFAULT_TRACKING },
                 relationships: [],
                 chapters: [chapterId],
             });
@@ -2549,7 +3363,7 @@ const applyChroniclerSideEffects = (
     };
 };
 
-const applyChroniclerOutput = (universe: Universe, output: ChroniclerOutput): void => {
+const applyChroniclerOutput = (universe: Universe, output: ChroniclerOutput, chapterId?: string): void => {
     const codex = output.newCodex;
     if (!codex) return;
 
@@ -2577,9 +3391,26 @@ const applyChroniclerOutput = (universe: Universe, output: ChroniclerOutput): vo
     const newRules = takeIfUnknown(codex.rules || []);
     const newTimeline = takeIfUnknown(codex.timeline || []);
 
-    if (newFactions.length) universe.codex.factions.push(...newFactions.map(f => ({ id: generateId(), ...f })));
-    if (newRules.length) universe.codex.rules.push(...newRules.map(r => ({ id: generateId(), ...r })));
-    if (newTimeline.length) universe.codex.timeline.push(...newTimeline.map(t => ({ id: generateId(), ...t })));
+    if (newFactions.length) universe.codex.factions.push(...newFactions.map(f => ensureCodexEntryDefaults({
+        id: generateId(),
+        ...f,
+        relatedEntityIds: inferRelatedEntityIds(universe, `${f.title} ${f.content}`),
+        truth: createTruthBundle(`faction:${normalizeTitle(f.title)}`, f.content, chapterId, truncateText(f.content, 180)),
+    })));
+    if (newRules.length) universe.codex.rules.push(...newRules.map(r => ensureCodexEntryDefaults({
+        id: generateId(),
+        ...r,
+        relatedEntityIds: inferRelatedEntityIds(universe, `${r.title} ${r.content}`),
+        truth: createTruthBundle(`rule:${normalizeTitle(r.title)}`, r.content, chapterId, truncateText(r.content, 180)),
+    })));
+    if (newTimeline.length) universe.codex.timeline.push(...newTimeline.map(t => ensureCodexEntryDefaults({
+        id: generateId(),
+        ...t,
+        eventState: inferTimelineEventState(t.title, t.content),
+        discoveryKind: inferTimelineDiscoveryKind(t.title, t.content),
+        relatedEntityIds: inferRelatedEntityIds(universe, `${t.title} ${t.content}`),
+        truth: createTruthBundle(`timeline:${normalizeTitle(t.title)}`, t.content, chapterId, truncateText(t.content, 180)),
+    })));
 };
 
 const updateNarrativeMemoryFromChronicler = (
@@ -2626,6 +3457,8 @@ const updateNarrativeMemoryFromChronicler = (
         recentEvents,
         newCodexEntries: output.newCodex || { factions: [], rules: [], timeline: [] },
         lastAuditFlags: output.auditFlags ?? prev?.lastAuditFlags,
+        lexicalCooldownGuidance: prev?.lexicalCooldownGuidance,
+        lieStates: prev?.lieStates,
         lexicalCooldown: prev?.lexicalCooldown,  // preserved — Director manages expiry each chapter
         directorGuidance: prev?.directorGuidance,  // preserved — Director updates it each chapter
     };
@@ -2665,6 +3498,7 @@ export const generateCharacter = async (universeName: string, lang?: 'pt' | 'en'
     return {
         id: generateId(),
         name: fallbackName,
+        aliases: [],
         imageUrl: createPortraitUrl({
             name: fallbackName,
             role: String(data.role || 'Coadjuvante'),
@@ -2678,17 +3512,21 @@ export const generateCharacter = async (universeName: string, lang?: 'pt' | 'en'
         age: data.age || 25,
         alignment: data.alignment || 'Neutro',
         bio: data.bio || 'Uma figura misteriosa.',
+        notesPrivate: '',
+        aiVisibility: DEFAULT_AI_VISIBILITY,
+        tracking: { ...DEFAULT_TRACKING },
         relationships: [],
         chapters: [],
     };
 };
 
 export const suggestNextChapterPlot = async (universe: Universe, chapterIndex?: number): Promise<{ title: string, plot: string, activeCharacters: string[] }> => {
-    const memoryCtx = buildMemoryContext(universe, chapterIndex);
-    const worldContext = buildUniverseContext(universe);
-    const weaverPrompt = getAgentPrompt(universe, 'weaver');
-    const langMandateText = langMandate(universe.lang ?? 'pt');
-    const profileCtx = buildProfileContext(universe.storyProfile);
+    const preparedUniverse = await prepareUniverseForManualDirection(universe);
+    const memoryCtx = buildMemoryContext(preparedUniverse, chapterIndex);
+    const worldContext = buildUniverseContext(preparedUniverse, { relatedEntityIds: preparedUniverse.characters.map(character => character.id), maxTimeline: 4 });
+    const weaverPrompt = getAgentPrompt(preparedUniverse, 'weaver');
+    const langMandateText = langMandate(preparedUniverse.lang ?? 'pt');
+    const profileCtx = buildProfileContext(preparedUniverse.storyProfile);
 
     const result = await chatJson<{
         title?: string;
@@ -2711,8 +3549,14 @@ export const suggestNextChapterPlot = async (universe: Universe, chapterIndex?: 
         ${worldContext}
         ${memoryCtx}
 
+        === DIRECTOR GUIDANCE ===
+        Narrative Pressure: ${preparedUniverse.narrativeMemory?.directorGuidance?.narrativePressure || 'Keep escalation coherent and avoid rush.'}
+        Character Focus: ${preparedUniverse.narrativeMemory?.directorGuidance?.characterFocus || 'Keep the protagonist active.'}
+        Loop Priority: ${preparedUniverse.narrativeMemory?.directorGuidance?.loopPriority || 'Advance the most urgent unresolved thread.'}
+        Thematic Constraint: ${preparedUniverse.narrativeMemory?.directorGuidance?.thematicConstraint || 'Let consequence and theme press into each scene.'}
+
         ACTIVE CHARACTERS:
-        ${buildCompactCharacterList(universe)}
+        ${buildCompactCharacterList(preparedUniverse)}
 
         Return only valid JSON with this exact shape:
         {
@@ -2741,11 +3585,12 @@ export const generateWeaverPlans = async (
     universe: Universe,
     params: ChapterGenerationParams,
 ): Promise<WeaverPlan[]> => {
-    const memoryCtx = buildMemoryContext(universe, params.chapterIndex);
-    const worldContext = buildUniverseContext(universe);
-    const profileCtx = buildProfileContext(universe.storyProfile);
-    const langMandateText = langMandate(params.lang ?? universe.lang ?? 'pt');
-    const weaverPrompt = getAgentPrompt(universe, 'weaver');
+    const preparedUniverse = await prepareUniverseForManualDirection(universe, params.qualityMode);
+    const memoryCtx = buildMemoryContext(preparedUniverse, params.chapterIndex);
+    const worldContext = buildUniverseContext(preparedUniverse, { relatedEntityIds: deriveContextEntityIds(preparedUniverse, params.activeCharacterIds), maxTimeline: 4 });
+    const profileCtx = buildProfileContext(preparedUniverse.storyProfile);
+    const langMandateText = langMandate(params.lang ?? preparedUniverse.lang ?? 'pt');
+    const weaverPrompt = getAgentPrompt(preparedUniverse, 'weaver');
 
     const systemPrompt = `${weaverPrompt}
 
@@ -2765,6 +3610,13 @@ CONCISION MANDATE: Each "beat" field must be ONE sentence, maximum 20 words. No 
         ${worldContext}
         ${memoryCtx}
 
+        === DIRECTOR GUIDANCE ===
+        Narrative Pressure: ${preparedUniverse.narrativeMemory?.directorGuidance?.narrativePressure || 'Keep escalation coherent and avoid rush.'}
+        Character Focus: ${preparedUniverse.narrativeMemory?.directorGuidance?.characterFocus || 'Keep the protagonist active.'}
+        Faction Pressure: ${preparedUniverse.narrativeMemory?.directorGuidance?.factionPressure || 'Keep the world politically alive.'}
+        Loop Priority: ${preparedUniverse.narrativeMemory?.directorGuidance?.loopPriority || 'Advance the most urgent unresolved thread.'}
+        Thematic Constraint: ${preparedUniverse.narrativeMemory?.directorGuidance?.thematicConstraint || 'Let consequence and theme press into each scene.'}
+
         === ASSIGNMENT ===
         Title/Idea: "${params.title}"
         Plot Direction: "${params.plotDirection}"
@@ -2772,7 +3624,7 @@ CONCISION MANDATE: Each "beat" field must be ONE sentence, maximum 20 words. No 
         Focus: ${params.focus}
 
         ACTIVE CHARACTERS:
-        ${buildCompactCharacterList(universe)}
+        ${buildCompactCharacterList(preparedUniverse)}
 
         Return only valid JSON:
         {

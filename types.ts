@@ -1,18 +1,27 @@
-
 export type StoryFormat =
   | 'light_novel'
   | 'web_novel'
   | 'novel';
 
 export type StoryTheme =
+  | 'redencao'
   | 'redenção'
+  | 'poder_e_corrupcao'
   | 'poder_e_corrupção'
   | 'amor_proibido'
   | 'identidade'
+  | 'vinganca'
   | 'vingança'
+  | 'revolucao'
   | 'revolução'
+  | 'sobrevivencia'
   | 'sobrevivência'
-  | 'traição';
+  | 'sacrificio'
+  | 'sacrifício'
+  | 'traicao'
+  | 'traição'
+  | 'jornada_do_heroi'
+  | 'jornada_do_herói';
 
 export type LiteraryArchetype =
   | 'tolkien'
@@ -49,9 +58,56 @@ export interface ToastMessage {
   type: 'success' | 'error';
 }
 
+export type AIVisibility = 'global' | 'tracked' | 'hidden';
+export type DirtyScope = 'project' | 'characters' | 'codex' | 'timeline' | 'factions' | 'rules' | 'chapters';
+
+export interface SyncMeta {
+  canonVersion: number;
+  memoryVersion: number;
+  dirtyScopes: DirtyScope[];
+  lastSyncAt?: string;
+  lastSyncMode?: 'light' | 'deep';
+}
+
+export interface TrackingConfig {
+  trackByAlias: boolean;
+  caseSensitive: boolean;
+  exclusions: string[];
+}
+
+export type TruthLayerKind = 'CANON' | 'BELIEF' | 'MYTH';
+
+export interface TruthLayerRecord {
+  kind: TruthLayerKind;
+  statement: string;
+  ownerId?: string;
+  sourceChapterId?: string;
+  sourceExcerpt?: string;
+  confidence?: number;
+}
+
+export interface TruthBundle {
+  eventKey: string;
+  needsReview?: boolean;
+  layers: TruthLayerRecord[];
+}
+
+export type TimelineEventState =
+  | 'historical'
+  | 'active_pressure'
+  | 'latent'
+  | 'resolved'
+  | 'forecast';
+
+export type TimelineDiscoveryKind =
+  | 'past_occurrence'
+  | 'present_discovery'
+  | 'forecast';
+
 export interface Character {
   id: string;
   name: string;
+  aliases: string[];
   imageUrl: string;
   role: 'Protagonista' | 'Antagonista' | 'Coadjuvante' | 'Mentor' | 'Figurante';
   faction: string;
@@ -59,6 +115,11 @@ export interface Character {
   age: number;
   alignment: string;
   bio: string;
+  notesPrivate?: string;
+  aiVisibility: AIVisibility;
+  tracking?: TrackingConfig;
+  ghost?: string;
+  coreLie?: string;
   relationships: { characterId: string; description: string }[];
   chapters: string[];
 }
@@ -78,8 +139,10 @@ export interface Chapter {
   status: 'Rascunho' | 'Revisado' | 'Aprovado';
   content: string;
   summary: string;
-  endHook?: string;       // The cliffhanger/hook the Weaver planned for this chapter
+  endHook?: string;
   openingStyle?: OpeningStyle;
+  aiVisibility?: AIVisibility;
+  notesPrivate?: string;
 }
 
 export interface ArbiterIssue {
@@ -88,8 +151,6 @@ export interface ArbiterIssue {
   description: string;
   suggestion: string;
 }
-
-// ─── Narrative Memory (Layered Memory System) ───────────────────────────────
 
 export interface CharacterState {
   characterId: string;
@@ -103,38 +164,58 @@ export interface CharacterState {
 export interface OpenLoop {
   id: string;
   description: string;
-  introduced: number;   // chapter index where it first appeared
-  resolved?: number;    // chapter index where it was resolved (undefined = still open)
+  introduced: number;
+  resolved?: number;
 }
 
 export interface DirectorGuidance {
-  openLoopCount: number;                       // how many loops are currently unresolved
-  loopPriority: string;                        // the oldest/most urgent open loop + deadline in cycles
-  factionPressure: string;                     // which faction is underrepresented or dominant
-  characterFocus: string;                      // what the protagonist must actively do/confront this chapter
-  thematicConstraint: string;                  // the thematic pressure that must bear down on this chapter
-  narrativePressure: string;                   // the GM-level tension to inject — not a prescribed action
-  wordsToSetOnCooldown: string[];              // words detected as overused — engine will apply 2-chapter cooldown
+  openLoopCount: number;
+  loopPriority: string;
+  factionPressure: string;
+  characterFocus: string;
+  thematicConstraint: string;
+  narrativePressure: string;
+  wordsToSetOnCooldown: string[];
+  cooldownSubstitutions?: Array<{ term: string; note: string }>;
+  contradictionSummary?: string;
+  liePressureSource?: string;
+  protagonistLieStability?: number;
+  ruptureRequired?: boolean;
+}
+
+export interface CharacterLieState {
+  characterId: string;
+  name: string;
+  coreLie: string;
+  lieStability: number;
+  pressureSources: string[];
+  contradictions: string[];
+  ruptureRequired?: boolean;
+  lastUpdatedChapter: number;
 }
 
 export interface NarrativeMemory {
   lastChapterIndex: number;
-  globalSummary: string;                       // running story summary
-  characterStates: CharacterState[];           // latest state per character
-  openLoops: OpenLoop[];                       // unresolved plot threads
-  recentEvents: string[];                      // last ~5 key events for quick context
-  newCodexEntries: {                           // extracted by Chronicler (Pass 3)
+  globalSummary: string;
+  characterStates: CharacterState[];
+  openLoops: OpenLoop[];
+  recentEvents: string[];
+  newCodexEntries: {
     factions: Array<{ title: string; content: string }>;
     rules: Array<{ title: string; content: string }>;
     timeline: Array<{ title: string; content: string }>;
   };
-  lastAuditFlags?: {                           // quality flags from previous Chronicler
+  lastAuditFlags?: {
     wordOveruse?: string[];
     sceneObjectiveCheck?: string;
     passiveProtagonist?: string;
+    rhetoricalPatternOveruse?: string;
+    rhetoricalPatternCount?: number;
   };
-  lexicalCooldown?: Record<string, number>;    // word → chapterIndex at which cooldown expires
-  directorGuidance?: DirectorGuidance;         // Director output — per-chapter narrative health
+  lexicalCooldown?: Record<string, number>;
+  lexicalCooldownGuidance?: Record<string, string>;
+  lieStates?: CharacterLieState[];
+  directorGuidance?: DirectorGuidance;
 }
 
 export interface VisualAsset {
@@ -142,7 +223,7 @@ export interface VisualAsset {
   url: string;
   prompt: string;
   type: 'character' | 'location' | 'cover' | 'concept';
-  relatedTo: string; // Character ID, Location Name, Chapter ID etc.
+  relatedTo: string;
 }
 
 export interface SoundAsset {
@@ -156,21 +237,31 @@ export interface SoundAsset {
 export interface CodexEntry {
   id: string;
   title: string;
+  aliases: string[];
   content: string;
+  notesPrivate?: string;
+  aiVisibility: AIVisibility;
+  tracking?: TrackingConfig;
+  truth?: TruthBundle;
+  eventState?: TimelineEventState;
+  discoveryKind?: TimelineDiscoveryKind;
+  relatedEntityIds?: string[];
+  dependsOnIds?: string[];
 }
 
 export interface AgentConfig {
-    id: string;
-    name: string;
-    role: string;
-    description: string;
-    systemPrompt: string; // The customizable brain
-    color: string;
+  id: string;
+  name: string;
+  role: string;
+  description: string;
+  systemPrompt: string;
+  color: string;
 }
 
 export interface Universe {
   id: string;
   name: string;
+  subtitle?: string;
   description: string;
   lastGenerated: string;
   lang?: 'pt' | 'en';
@@ -189,56 +280,55 @@ export interface Universe {
   agentConfigs?: Record<string, AgentConfig>;
   storyProfile?: StoryProfile;
   narrativeMemory?: NarrativeMemory;
+  notesPrivate?: string;
+  syncMeta?: SyncMeta;
 }
 
 export interface WeaverPlan {
-    chapterTitle: string;
-    scenes: Array<{ beat: string; characters: string[]; tension: string }>;
-    chapterSummary: string;
-    endHook: string;
+  chapterTitle: string;
+  scenes: Array<{ beat: string; characters: string[]; tension: string }>;
+  chapterSummary: string;
+  endHook: string;
 }
 
 export type GenerationQualityMode = 'balanced' | 'economy';
 
 export interface ChapterGenerationParams {
-    title: string;
-    plotDirection: string;
-    activeCharacterIds: string[];
-    tone: 'Sombrio' | 'Épico' | 'Misterioso' | 'Dramático' | 'Humorístico' | 'Lírico';
-    focus: 'Ação' | 'Diálogo' | 'Lore' | 'Introspecção';
-    chapterIndex?: number; // 0-based position in the chapter list to write at
-    lang?: 'pt' | 'en';
-    skipWeaver?: boolean;  // bypass Weaver LLM call and use pre-built plan (e.g. genesis chapter)
-    prebuiltPlan?: WeaverPlan; // plan to use when skipWeaver is true
-    qualityMode?: GenerationQualityMode;
-    density?: 'scene' | 'chapter' | 'arc'; // scene=1-3 beats, chapter=5-7 (default), arc=time-skip prose
+  title: string;
+  plotDirection: string;
+  activeCharacterIds: string[];
+  tone: 'Sombrio' | 'Épico' | 'Misterioso' | 'Dramático' | 'Humorístico' | 'Lírico';
+  focus: 'Ação' | 'Diálogo' | 'Lore' | 'Introspecção';
+  chapterIndex?: number;
+  lang?: 'pt' | 'en';
+  skipWeaver?: boolean;
+  prebuiltPlan?: WeaverPlan;
+  qualityMode?: GenerationQualityMode;
+  density?: 'scene' | 'chapter' | 'arc';
+  directorPrepared?: boolean;
 }
 
 export type GenerationStep = 'idle' | 'anchors' | 'protagonist' | 'world_rules' | 'factions' | 'characters' | 'plotting' | 'writing_intro' | 'chronicler' | 'visualizing' | 'done';
 
-// ─── Token Usage Tracker ─────────────────────────────────────────────────────
-
 export interface TokenUsageEvent {
   id: string;
   timestamp: number;
-  provider: 'groq' | 'gemini' | 'cerebras';
+  provider: 'groq' | 'gemini' | 'cerebras' | 'openrouter';
   model: string;
-  label: string;          // e.g. "Weaver · Capítulo 3"
+  label: string;
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
 }
 
-// ─── Agent Output Events (thinking panel) ────────────────────────────────────
-
 export type AgentOutputStatus = 'thinking' | 'done' | 'error';
 
 export interface AgentOutputEvent {
   id: string;
-  agent: string;           // e.g. "weaver", "bard", "chronicler"
-  label: string;           // e.g. "Weaver · Planner"
-  status: AgentOutputStatus;
-  summary?: string;        // short human-readable output summary
-  detail?: string;         // full output (JSON stringified or prose snippet)
   timestamp: number;
+  agent: string;
+  label: string;
+  status: AgentOutputStatus;
+  summary?: string;
+  detail?: string;
 }

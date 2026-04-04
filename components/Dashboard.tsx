@@ -6,6 +6,7 @@ import type { Universe, View, GenerationStep, StoryProfile, StoryFormat, StoryTh
 import Button from './ui/Button';
 import Card from './ui/Card';
 import Tooltip from './ui/Tooltip';
+import InlineHelp from './ui/InlineHelp';
 import CharacterPortrait from './ui/CharacterPortrait';
 import { BookOpen, Users, FileText, Sparkles, Clock, Zap, Hammer, Loader2, Download, Upload, Check, ArrowRight, Shuffle, Square, Globe } from 'lucide-react';
 import type { AutogenProgress } from '../services/geminiService';
@@ -51,6 +52,8 @@ const DEFAULT_PROFILE: StoryProfile = {
   themes: [],
   archetypes: [],
 };
+
+const FORGE_PANEL_WIDTH_CLASS = 'w-full max-w-[860px]';
 
 // ─── Randomize helpers ────────────────────────────────────────────────────────
 const randomFrom = <T,>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)];
@@ -135,7 +138,8 @@ const ForgeProfilePanel: React.FC<{
   onChange: (p: StoryProfile) => void;
   onGenerate: () => void;
   isLoading: boolean;
-}> = ({ profile, onChange, onGenerate, isLoading }) => {
+  footerContent?: React.ReactNode;
+}> = ({ profile, onChange, onGenerate, isLoading, footerContent }) => {
   const { t, lang } = useLanguage();
 
   // Build translated option lists
@@ -176,7 +180,7 @@ const ForgeProfilePanel: React.FC<{
       animate={{ opacity: 1, y: 0, scale: 1 }}
       exit={{ opacity: 0, y: 8, scale: 0.98 }}
       transition={{ duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
-      className="w-full max-w-2xl bg-white border border-stone-200 rounded-2xl shadow-xl"
+      className={`${FORGE_PANEL_WIDTH_CLASS} bg-white border border-stone-200 rounded-2xl shadow-xl`}
     >
       {/* Header */}
       <div className="bg-stone-900 px-6 py-4 flex items-center justify-between rounded-t-2xl">
@@ -230,6 +234,7 @@ const ForgeProfilePanel: React.FC<{
             <label className="text-xs font-bold uppercase tracking-widest text-stone-500 flex items-center gap-1.5">
               <Sparkles className="w-3 h-3 text-nobel" />
               {t('forge.premise')}
+              <InlineHelp content={t('help.dashboard.premise')} />
             </label>
             <button
               onClick={() => {
@@ -254,34 +259,34 @@ const ForgeProfilePanel: React.FC<{
         <div className="border-t border-stone-100" />
 
         {/* FORMAT */}
-        <div>
+        <div className="space-y-3">
           <div className="flex items-center justify-between mb-3">
             <label className="text-xs font-bold uppercase tracking-widest text-stone-500">{t('forge.format')}</label>
             <button onClick={() => set('format', randomFrom(FORMAT_SPECS).id)} className="flex items-center gap-1 text-[10px] text-stone-400 hover:text-stone-600 transition-colors">
               <Shuffle className="w-3 h-3" />{t('forge.randomizeSection')}
             </button>
           </div>
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-            {!profile.format && (
-              <div className="col-span-full text-[11px] text-stone-400 italic mb-1">{t('forge.anyRandom')}</div>
-            )}
+          {!profile.format && (
+            <p className="text-[11px] text-stone-400 italic">{t('forge.anyRandom')}</p>
+          )}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             {formats.map(f => (
               <Tooltip key={f.id} content={f.tooltip} position="top">
                 <button
                   onClick={() => set('format', profile.format === f.id ? undefined : f.id)}
-                  className={`w-full text-left px-3 py-2.5 rounded-lg border transition-all duration-200 ${
+                  className={`w-full h-full text-left px-4 py-3 rounded-xl border transition-all duration-200 ${
                     profile.format === f.id
                       ? 'border-nobel bg-amber-50 shadow-sm'
                       : 'border-stone-200 hover:border-stone-400'
                   }`}
                 >
-                  <div className="flex items-center justify-between mb-0.5">
-                    <span className={`text-sm font-semibold ${
+                  <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between mb-1.5">
+                    <span className={`text-base font-semibold leading-none ${
                       profile.format === f.id ? 'text-stone-900' : 'text-stone-700'
                     }`}>{f.label}</span>
-                    <span className="text-[10px] text-stone-400 font-mono">{f.words}</span>
+                    <span className="text-[11px] text-stone-400 font-mono tracking-wide sm:text-right">{f.words}</span>
                   </div>
-                  <span className="text-[11px] text-stone-500 leading-tight block">{f.sub}</span>
+                  <span className="text-sm text-stone-500 leading-snug block">{f.sub}</span>
                 </button>
               </Tooltip>
             ))}
@@ -372,17 +377,22 @@ const ForgeProfilePanel: React.FC<{
       </div>
 
       {/* Footer */}
-      <div className="px-6 py-4 bg-stone-50 border-t border-stone-100 flex items-center justify-between rounded-b-2xl">
-        <p className="text-xs text-stone-400 font-serif italic">
-          {profile.themes.length === 0 && profile.archetypes.length === 0 && !profile.format && !profile.tone && !profile.pov
-            ? t('forge.footerFree')
-            : `${profile.themes.length} ${t('forge.themes').toLowerCase()} · ${profile.archetypes.length} ${t('forge.archetypes').toLowerCase()}`
-          }
-        </p>
-        <Button onClick={onGenerate} isLoading={isLoading} className="bg-stone-900 text-white hover:bg-black">
-          <Sparkles className="w-4 h-4 mr-2" />
-          {t('forge.cta')}
-        </Button>
+      <div className="px-6 py-4 bg-stone-50 border-t border-stone-100 rounded-b-2xl">
+        <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+          <div className="flex flex-col gap-2">
+            <p className="text-xs text-stone-400 font-serif italic">
+              {profile.themes.length === 0 && profile.archetypes.length === 0 && !profile.format && !profile.tone && !profile.pov
+                ? t('forge.footerFree')
+                : `${profile.themes.length} ${t('forge.themes').toLowerCase()} - ${profile.archetypes.length} ${t('forge.archetypes').toLowerCase()}`
+              }
+            </p>
+            {footerContent}
+          </div>
+          <Button onClick={onGenerate} isLoading={isLoading} className="bg-stone-900 text-white hover:bg-black self-start md:self-auto">
+            <Sparkles className="w-4 h-4 mr-2" />
+            {t('forge.cta')}
+          </Button>
+        </div>
       </div>
     </motion.div>
   );
@@ -574,7 +584,7 @@ export default function Dashboard({
         </div>
 
         {/* Path Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-5 w-full max-w-4xl mb-0">
+        <div className={`grid grid-cols-1 md:grid-cols-3 gap-5 ${FORGE_PANEL_WIDTH_CLASS} mb-0`}>
           {[
             {
               id: 'architect' as const,
@@ -631,9 +641,11 @@ export default function Dashboard({
                   {card.icon}
                 </div>
                 <h3 className="font-serif text-xl font-bold text-stone-dark mb-0.5">{card.title}</h3>
-                <p className={`text-xs font-bold uppercase tracking-widest mb-2 ${card.id === 'genesis' || card.id === 'autogen' ? 'text-nobel' : 'text-stone-400'}`}>
-                  {card.tagline}
-                </p>
+                <div className={`mb-2 flex items-center gap-2 text-xs font-bold uppercase tracking-widest ${card.id === 'genesis' || card.id === 'autogen' ? 'text-nobel' : 'text-stone-400'}`}>
+                  <span>{card.tagline}</span>
+                  {card.id === 'genesis' && <InlineHelp content={t('help.dashboard.genesis')} />}
+                  {card.id === 'autogen' && <InlineHelp content={t('help.dashboard.autogen')} />}
+                </div>
                 <p className="text-stone-500 text-sm leading-relaxed">{card.desc}</p>
               </button>
             );
@@ -641,7 +653,7 @@ export default function Dashboard({
         </div>
 
         {/* Expanded Panel */}
-        <div className="w-full max-w-4xl mt-0">
+        <div className={`${FORGE_PANEL_WIDTH_CLASS} mt-5`}>
           <AnimatePresence mode="wait">
             {activePath === 'architect' && (
               <motion.div
@@ -650,7 +662,7 @@ export default function Dashboard({
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: 8 }}
                 transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
-                className="mt-5 bg-white border border-stone-200 rounded-2xl shadow-lg overflow-hidden"
+                className="bg-white border border-stone-200 rounded-2xl shadow-lg overflow-hidden"
               >
                 <div className="bg-stone-900 px-6 py-4 flex items-center gap-3">
                   <Hammer className="w-5 h-5 text-stone-400" />
@@ -733,7 +745,7 @@ export default function Dashboard({
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: 8 }}
                 transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
-                className="mt-5"
+                className="flex justify-center"
               >
                 <ForgeProfilePanel
                   profile={profile}
@@ -751,37 +763,36 @@ export default function Dashboard({
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: 8 }}
                 transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
-                className="mt-5"
+                className="flex justify-center"
               >
-                <div className="w-full max-w-2xl mx-auto">
-                  <ForgeProfilePanel
-                    profile={profile}
-                    onChange={setProfile}
-                    onGenerate={() => onAutoGen?.(profile, autoGenChapters)}
-                    isLoading={isLoading}
-                  />
-                  {/* Chapter count selector — overlays on top of ForgeProfilePanel footer */}
-                  <div className="-mt-[60px] relative z-10 mx-6 mb-4 flex items-center justify-between">
-                    <div className="flex items-center gap-2">
+                <ForgeProfilePanel
+                  profile={profile}
+                  onChange={setProfile}
+                  onGenerate={() => onAutoGen?.(profile, autoGenChapters)}
+                  isLoading={isLoading}
+                  footerContent={
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
                       <span className="text-xs font-bold uppercase tracking-widest text-stone-500">
-                        {lang === 'pt' ? 'Capítulos:' : 'Chapters:'}
+                        {lang === 'pt' ? 'Capítulos totais:' : 'Total chapters:'}
                       </span>
-                      {AUTOGEN_CHAPTER_OPTIONS.map(n => (
-                        <button
-                          key={n}
-                          onClick={() => setAutoGenChapters(n)}
-                          className={`w-8 h-8 rounded-lg border text-sm font-bold transition-all ${
-                            autoGenChapters === n
-                              ? 'border-nobel bg-amber-50 text-stone-900'
-                              : 'border-stone-300 text-stone-500 hover:border-stone-500'
-                          }`}
-                        >
-                          {n}
-                        </button>
-                      ))}
+                      <div className="flex items-center gap-2">
+                        {AUTOGEN_CHAPTER_OPTIONS.map(n => (
+                          <button
+                            key={n}
+                            onClick={() => setAutoGenChapters(n)}
+                            className={`min-w-[42px] h-10 px-3 rounded-xl border text-sm font-bold transition-all ${
+                              autoGenChapters === n
+                                ? 'border-nobel bg-amber-50 text-stone-900 shadow-sm'
+                                : 'border-stone-300 text-stone-500 hover:border-stone-500'
+                            }`}
+                          >
+                            {n}
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                  </div>
-                </div>
+                  }
+                />
               </motion.div>
             )}
           </AnimatePresence>
@@ -792,10 +803,22 @@ export default function Dashboard({
 
   // State 3: Main Dashboard
   if (universe) {
-    const latestImage = universe.assets.visual[universe.assets.visual.length - 1]?.url;
-    const latestChapter = universe.chapters[universe.chapters.length - 1];
-    const protagonist = universe.characters.find(character => character.role === 'Protagonista') || universe.characters[0] || null;
-    const recentCharacters = [...universe.characters].reverse().slice(0, 5);
+    const visualAssets = universe.assets?.visual ?? [];
+    const chapters = universe.chapters ?? [];
+    const characters = universe.characters ?? [];
+    const codex = universe.codex ?? { factions: [], rules: [], timeline: [] };
+    const latestImage = visualAssets[visualAssets.length - 1]?.url;
+    const latestChapter = chapters[chapters.length - 1];
+    const latestChapterTitle = typeof latestChapter?.title === 'string' && latestChapter.title.trim().length > 0
+        ? latestChapter.title
+        : 'Capítulo sem título';
+    const latestChapterPreview = typeof latestChapter?.content === 'string' && latestChapter.content.trim().length > 0
+        ? latestChapter.content.replace(/<[^>]*>?/gm, '')
+        : (typeof latestChapter?.summary === 'string' && latestChapter.summary.trim().length > 0
+            ? latestChapter.summary
+            : t('dash3.blank'));
+    const protagonist = characters.find(character => character.role === 'Protagonista') || characters[0] || null;
+    const recentCharacters = [...characters].reverse().slice(0, 5);
 
     return (
         <div className="space-y-6 max-w-7xl mx-auto pb-12">
@@ -850,9 +873,9 @@ export default function Dashboard({
                         </div>
                         {latestChapter ? (
                             <>
-                                <h2 className="text-3xl font-serif font-bold text-stone-dark mb-4 group-hover:text-nobel transition-colors">{latestChapter.title}</h2>
+                                <h2 className="text-3xl font-serif font-bold text-stone-dark mb-4 group-hover:text-nobel transition-colors">{latestChapterTitle}</h2>
                                 <p className="text-stone-600 font-serif leading-relaxed line-clamp-4 text-lg">
-                                    {latestChapter.content.replace(/<[^>]*>?/gm, '') || t('dash3.blank')}
+                                    {latestChapterPreview}
                                 </p>
                             </>
                         ) : (
@@ -915,13 +938,13 @@ export default function Dashboard({
                             <Users className="w-4 h-4 mr-2" />
                             <h3 className="text-xs font-bold uppercase tracking-widest">{t('dash3.pantheon')}</h3>
                         </div>
-                        <span className="text-3xl font-serif font-bold text-stone-dark">{universe.characters.length}</span>
+                        <span className="text-3xl font-serif font-bold text-stone-dark">{characters.length}</span>
                     </div>
                     <div className="flex -space-x-3 overflow-hidden mt-4">
                         {recentCharacters.map((char, i) => (
                         <CharacterPortrait key={char.id} name={char.name} imageUrl={char.imageUrl} role={char.role} faction={char.faction} className="inline-block h-12 w-12 rounded-full ring-2 ring-white object-cover shadow-sm" style={{ zIndex: 10 - i }} />
                         ))}
-                        {universe.characters.length === 0 && <span className="text-xs text-stone-400 italic">{t('dash3.noEntities')}</span>}
+                        {characters.length === 0 && <span className="text-xs text-stone-400 italic">{t('dash3.noEntities')}</span>}
                     </div>
                 </Card>
 
@@ -932,7 +955,7 @@ export default function Dashboard({
                             <BookOpen className="w-4 h-4 mr-2" />
                             <h3 className="text-xs font-bold uppercase tracking-widest">{t('dash3.codex')}</h3>
                         </div>
-                        <span className="text-3xl font-serif font-bold text-stone-dark">{(universe.codex.factions?.length ?? 0) + (universe.codex.rules?.length ?? 0) + (universe.codex.timeline?.length ?? 0)}</span>
+                        <span className="text-3xl font-serif font-bold text-stone-dark">{(codex.factions?.length ?? 0) + (codex.rules?.length ?? 0) + (codex.timeline?.length ?? 0)}</span>
                     </div>
                     <p className="text-sm text-stone-500 font-serif mt-2 leading-relaxed">{t('dash3.codexDesc')}</p>
                 </Card>
@@ -951,7 +974,7 @@ export default function Dashboard({
                                 </div>
                                 <div>
                                     <p className="text-sm font-bold text-stone-800">{t('dash3.chapterWritten')}</p>
-                                    <p className="text-xs text-stone-500 font-serif italic">{latestChapter.title}</p>
+                                    <p className="text-xs text-stone-500 font-serif italic">{latestChapterTitle}</p>
                                 </div>
                             </div>
                         )}
@@ -964,7 +987,7 @@ export default function Dashboard({
                                 </div>
                             </div>
                         ))}
-                        {universe.chapters.length === 0 && universe.characters.length === 0 && (
+                        {chapters.length === 0 && characters.length === 0 && (
                             <p className="text-sm text-stone-400 italic font-serif">{t('dash3.universeQuiet')}</p>
                         )}
                     </div>

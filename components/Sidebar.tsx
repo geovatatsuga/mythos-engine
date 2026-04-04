@@ -1,10 +1,7 @@
-
-import React, { useState } from 'react';
+import React from 'react';
 import type { View } from '../types';
 import { ICONS } from '../constants';
 import Tooltip from './ui/Tooltip';
-import ApiKeyModal from './ui/ApiKeyModal';
-import { EMPTY_API_KEYS, loadApiKeys, saveApiKeys } from '../utils/apiKeys';
 import { Globe } from 'lucide-react';
 import { useLanguage } from '../LanguageContext';
 
@@ -46,26 +43,14 @@ const NavItem: React.FC<{
   );
 };
 
-
 export default function Sidebar({ currentView, setCurrentView, universeExists }: SidebarProps) {
   const { t, lang, toggleLang } = useLanguage();
   const navItems: { view: View; label: string }[] = [
     { view: 'dashboard', label: t('nav.dashboard') },
     { view: 'codex', label: t('nav.codex') },
-    { view: 'characters', label: t('nav.characters') },
     { view: 'chapters', label: t('nav.chapters') },
     { view: 'assets', label: t('nav.assets') },
   ];
-
-  // Controle do modal de API Key
-  const [apiModalOpen, setApiModalOpen] = useState(false);
-  const [apiKeys, setApiKeys] = useState(() => loadApiKeys() || EMPTY_API_KEYS);
-
-  const handleSaveKeys = (keys: { groq: string; gemini: string; cerebras: string }) => {
-    saveApiKeys(keys);
-    setApiKeys(keys);
-    setApiModalOpen(false);
-  };
 
   return (
     <nav className="flex flex-col items-center gap-y-6 bg-surface p-4 border-r border-stone-200 shadow-sm z-20">
@@ -85,19 +70,6 @@ export default function Sidebar({ currentView, setCurrentView, universeExists }:
         ))}
       </div>
 
-      {/* Botão para abrir modal de API Key */}
-      <div className="mt-8">
-        <Tooltip content="Configurar API Keys" position="right">
-          <button
-            onClick={() => setApiModalOpen(true)}
-            className="w-12 h-12 flex items-center justify-center rounded-lg border border-nobel/40 bg-paper hover:bg-nobel/10 transition-all shadow-sm text-nobel"
-          >
-            <span className="font-bold text-lg">🔑</span>
-          </button>
-        </Tooltip>
-      </div>
-
-      {/* Language Toggle — bottom of sidebar */}
       <div className="mt-auto mb-14 flex flex-col items-center gap-2">
         <Tooltip content={lang === 'pt' ? 'Switch to English' : 'Mudar para Português'} position="right">
           <button
@@ -111,14 +83,6 @@ export default function Sidebar({ currentView, setCurrentView, universeExists }:
           </button>
         </Tooltip>
       </div>
-
-      {/* Modal de API Key */}
-      <ApiKeyModal
-        isOpen={apiModalOpen}
-        onClose={() => setApiModalOpen(false)}
-        onSave={handleSaveKeys}
-        initialKeys={apiKeys}
-      />
     </nav>
   );
 }

@@ -23,6 +23,11 @@ const PROVIDER_STYLE = {
     dot: 'bg-purple-400',
     label: 'Cerebras',
   },
+  openrouter: {
+    badge: 'bg-emerald-100 text-emerald-700 border border-emerald-200',
+    dot: 'bg-emerald-400',
+    label: 'OpenRouter',
+  },
 } as const;
 
 const fmt = (n: number) => n.toLocaleString('pt-BR');
@@ -38,6 +43,7 @@ const TokenTracker: React.FC<TokenTrackerProps> = ({ events, onClear }) => {
   const groqTotal = events.filter(e => e.provider === 'groq').reduce((s, e) => s + e.totalTokens, 0);
   const geminiTotal = events.filter(e => e.provider === 'gemini').reduce((s, e) => s + e.totalTokens, 0);
   const cerebrasTotal = events.filter(e => e.provider === 'cerebras').reduce((s, e) => s + e.totalTokens, 0);
+  const openrouterTotal = events.filter(e => e.provider === 'openrouter').reduce((s, e) => s + e.totalTokens, 0);
 
   const recent = expanded ? [...events].reverse() : [...events].reverse().slice(0, 5);
 
@@ -77,7 +83,7 @@ const TokenTracker: React.FC<TokenTrackerProps> = ({ events, onClear }) => {
           ) : (
             <>
               {/* Session summary */}
-              <div className="px-4 py-3 border-b border-stone-100 grid grid-cols-3 gap-2">
+              <div className="px-4 py-3 border-b border-stone-100 grid grid-cols-2 md:grid-cols-4 gap-2">
                 <div className="bg-orange-50 rounded-lg p-2 border border-orange-100">
                   <div className="flex items-center gap-1 mb-1">
                     <span className="w-2 h-2 rounded-full bg-orange-400 inline-block" />
@@ -102,7 +108,15 @@ const TokenTracker: React.FC<TokenTrackerProps> = ({ events, onClear }) => {
                   <p className="text-sm font-bold text-purple-900">{fmt(cerebrasTotal)}</p>
                   <p className="text-[10px] text-purple-500">tokens totais</p>
                 </div>
-                <div className="col-span-3 bg-stone-50 rounded-lg p-2 border border-stone-200 flex items-center justify-between">
+                <div className="bg-emerald-50 rounded-lg p-2 border border-emerald-100">
+                  <div className="flex items-center gap-1 mb-1">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400 inline-block" />
+                    <span className="text-[10px] font-semibold text-emerald-700">OpenRouter</span>
+                  </div>
+                  <p className="text-sm font-bold text-emerald-900">{fmt(openrouterTotal)}</p>
+                  <p className="text-[10px] text-emerald-500">tokens totais</p>
+                </div>
+                <div className="col-span-2 md:col-span-4 bg-stone-50 rounded-lg p-2 border border-stone-200 flex items-center justify-between">
                   <div>
                     <p className="text-[10px] text-stone-500">Sessão total</p>
                     <p className="text-sm font-bold text-stone-800">{fmt(totalAll)} tokens</p>
@@ -175,6 +189,11 @@ const TokenTracker: React.FC<TokenTrackerProps> = ({ events, onClear }) => {
         {cerebrasTotal > 0 && (
           <span className="flex items-center gap-0.5">
             <span className="w-1.5 h-1.5 rounded-full bg-purple-400" />
+          </span>
+        )}
+        {openrouterTotal > 0 && (
+          <span className="flex items-center gap-0.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
           </span>
         )}
         {events.length > 0 && (

@@ -44,9 +44,10 @@ const PROVIDER_COLOR: Record<string, string> = {
   groq:     '#f97316',
   gemini:   '#3b82f6',
   cerebras: '#a855f7',
+  openrouter: '#10b981',
 };
 const PROVIDER_LABEL: Record<string, string> = {
-  groq: 'Groq', gemini: 'Gemini', cerebras: 'Cerebras',
+  groq: 'Groq', gemini: 'Gemini', cerebras: 'Cerebras', openrouter: 'OpenRouter',
 };
 
 const fmt = (n: number) => n.toLocaleString('pt-BR');

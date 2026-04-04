@@ -5,8 +5,9 @@ import type { Universe, Character } from '../types';
 import Button from './ui/Button';
 import Card from './ui/Card';
 import Modal from './ui/Modal';
+import { markUniverseDirty } from '../services/geminiService';
 import CharacterPortrait from './ui/CharacterPortrait';
-import { Plus, Image as ImageIcon, Users, Share2, LayoutGrid } from 'lucide-react';
+import { Minus, Plus, Image as ImageIcon, LocateFixed, Users, Share2, LayoutGrid, Save } from 'lucide-react';
 import { useLanguage } from '../LanguageContext';
 
 // ── Role visual config ────────────────────────────────────────────────────────
@@ -21,13 +22,13 @@ const ROLE_CONFIG: Record<string, { size: number; color: string; mass: number; r
 
 const getEffectiveRole = (c: Character): string => {
   if (c.role === 'Protagonista') return 'Protagonista';
-  if (c.chapters.length === 0 && c.relationships.length === 0) return 'Figurante';
+  if ((c.chapters ?? []).length === 0 && (c.relationships ?? []).length === 0) return 'Figurante';
   return c.role;
 };
 
 const getRelDesc = (a: Character, b: Character): string | undefined =>
-  a.relationships.find(r => r.characterId === b.id)?.description ||
-  b.relationships.find(r => r.characterId === a.id)?.description;
+  (a.relationships ?? []).find(r => r.characterId === b.id)?.description ||
+  (b.relationships ?? []).find(r => r.characterId === a.id)?.description;
 
 const getEdgeColor = (desc?: string): string => {
   if (!desc) return '#78716c';
@@ -38,6 +39,57 @@ const getEdgeColor = (desc?: string): string => {
 };
 
 // ── Force simulation (Verlet, no external deps) ────────────────────────────────
+
+const hashPair = (a: string, b: string): number => {
+  const value = `${a}|${b}`;
+  let hash = 0;
+  for (let i = 0; i < value.length; i++) {
+    hash = ((hash << 5) - hash + value.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash);
+};
+
+const buildThreadPath = (
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  bendSeed: number,
+  strength: number,
+): string => {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const distance = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
+  const midX = (x1 + x2) / 2;
+  const midY = (y1 + y2) / 2;
+  const nx = -dy / distance;
+  const ny = dx / distance;
+  const direction = bendSeed % 2 === 0 ? 1 : -1;
+  const bend = Math.min(distance * (0.09 + strength * 0.012), 54) * direction;
+  const sway = ((bendSeed % 17) - 8) * 0.9;
+  const ctrlX = midX + nx * bend + (dx / distance) * sway;
+  const ctrlY = midY + ny * bend + (dy / distance) * sway;
+  return `M ${x1} ${y1} Q ${ctrlX} ${ctrlY} ${x2} ${y2}`;
+};
+
+const getEdgeAnchors = (
+  a: { x: number; y: number; sz: number },
+  b: { x: number; y: number; sz: number },
+) => {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const distance = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
+  const ux = dx / distance;
+  const uy = dy / distance;
+  const aRadius = Math.max(a.sz / 2 - 4, 10);
+  const bRadius = Math.max(b.sz / 2 - 4, 10);
+  return {
+    x1: a.x + ux * aRadius,
+    y1: a.y + uy * aRadius,
+    x2: b.x - ux * bRadius,
+    y2: b.y - uy * bRadius,
+  };
+};
 
 interface SimNode {
   id: string;
@@ -60,14 +112,14 @@ const runForceSimulation = (
   const edgeWeight = new Map<string, number>();
   const edgeKey = (a: string, b: string) => a < b ? `${a}|${b}` : `${b}|${a}`;
   for (const c of characters) {
-    for (const rel of c.relationships) {
+    for (const rel of (c.relationships ?? [])) {
       const key = edgeKey(c.id, rel.characterId);
       edgeWeight.set(key, (edgeWeight.get(key) ?? 0) + 2);
     }
     // Shared chapters also attract
     for (const other of characters) {
       if (other.id === c.id) continue;
-      const shared = c.chapters.filter(ch => other.chapters.includes(ch)).length;
+      const shared = (c.chapters ?? []).filter(ch => (other.chapters ?? []).includes(ch)).length;
       if (shared > 0) {
         const key = edgeKey(c.id, other.id);
         edgeWeight.set(key, (edgeWeight.get(key) ?? 0) + shared);
@@ -183,6 +235,7 @@ interface CharactersViewProps {
   onGenerateCharacter: () => void;
   onGenerateImage: (prompt: string) => void;
   onUpdateCharacterImage?: (characterId: string, prompt: string) => void;
+  onUpdateUniverse?: (universe: Universe) => void;
   isLoading: boolean;
 }
 
@@ -201,7 +254,7 @@ const CharacterCard: React.FC<{ character: Character; onSelect: () => void }> = 
 
 // ── Relationship Web ─────────────────────────────────────────────────────────
 
-const ConstellationView: React.FC<{
+export const RelationshipConstellation: React.FC<{
   characters: Character[];
   universe: Universe;
   onSelect: (c: Character) => void;
@@ -210,6 +263,17 @@ const ConstellationView: React.FC<{
   const [hovered, setHovered] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [dims, setDims] = useState({ width: 900, height: 680 });
+  const [viewport, setViewport] = useState({ x: 0, y: 0, scale: 1 });
+  const dragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
+  const safeCharacters = useMemo(
+    () => characters.map(character => ({
+      ...character,
+      aliases: character.aliases ?? [],
+      relationships: character.relationships ?? [],
+      chapters: character.chapters ?? [],
+    })),
+    [characters]
+  );
 
   // Measure container on mount
   useEffect(() => {
@@ -223,24 +287,71 @@ const ConstellationView: React.FC<{
     return () => ro.disconnect();
   }, []);
 
-  const protagonist = characters.find(c => c.role === 'Protagonista') || characters[0];
+  const handleWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const pointerX = event.clientX - rect.left;
+    const pointerY = event.clientY - rect.top;
+    setViewport(prev => {
+      const nextScale = Math.max(0.72, Math.min(1.9, prev.scale - event.deltaY * 0.0012));
+      const worldX = (pointerX - prev.x) / prev.scale;
+      const worldY = (pointerY - prev.y) / prev.scale;
+      return {
+        scale: nextScale,
+        x: pointerX - worldX * nextScale,
+        y: pointerY - worldY * nextScale,
+      };
+    });
+  }, []);
+
+  const handlePointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement;
+    if (target.closest('[data-node="true"]') || target.closest('[data-constellation-ui="true"]')) return;
+    dragRef.current = {
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: viewport.x,
+      originY: viewport.y,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }, [viewport.x, viewport.y]);
+
+  const handlePointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    const dx = event.clientX - dragRef.current.startX;
+    const dy = event.clientY - dragRef.current.startY;
+    setViewport(prev => ({ ...prev, x: dragRef.current!.originX + dx, y: dragRef.current!.originY + dy }));
+  }, []);
+
+  const endDrag = useCallback((event?: React.PointerEvent<HTMLDivElement>) => {
+    if (dragRef.current && event) {
+      try { event.currentTarget.releasePointerCapture(event.pointerId); } catch {}
+    }
+    dragRef.current = null;
+  }, []);
+
+  const protagonist = safeCharacters.find(c => c.role === 'Protagonista') || safeCharacters[0];
+  const aliveCount = useMemo(() => safeCharacters.filter(character => character.status !== 'Morto').length, [safeCharacters]);
+  const deadCount = useMemo(() => safeCharacters.filter(character => character.status === 'Morto').length, [safeCharacters]);
+  const activeCount = useMemo(() => safeCharacters.filter(character => character.chapters.length > 0).length, [safeCharacters]);
 
   // Run force simulation whenever characters or dims change
   const positions = useMemo(
-    () => runForceSimulation(characters, dims.width, dims.height),
+    () => runForceSimulation(safeCharacters, dims.width, dims.height),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [characters.map(c => c.id).join(','), dims.width, dims.height],
+    [safeCharacters.map(c => c.id).join(','), dims.width, dims.height],
   );
 
   // Build node list with absolute pixel positions
-  const nodes = useMemo(() => characters.map(c => {
+  const nodes = useMemo(() => safeCharacters.map(c => {
     const pos = positions.get(c.id) ?? { x: dims.width / 2, y: dims.height / 2 };
     const erole = getEffectiveRole(c);
     const cfg = ROLE_CONFIG[erole] ?? ROLE_CONFIG['Coadjuvante'];
     const connCount = c.relationships.length +
-      characters.filter(o => o.id !== c.id && o.relationships.some(r => r.characterId === c.id)).length;
+      safeCharacters.filter(o => o.id !== c.id && o.relationships.some(r => r.characterId === c.id)).length;
     return { ...c, x: pos.x, y: pos.y, sz: cfg.size, erole, color: cfg.color, ring: cfg.ring, connCount };
-  }), [characters, positions, dims]);
+  }), [safeCharacters, positions, dims]);
 
   // Ambient particles (fixed seed)
   const particles = useMemo(() => Array.from({ length: 32 }, (_, i) => ({
@@ -254,94 +365,182 @@ const ConstellationView: React.FC<{
   const edges = useMemo(() => {
     if (nodes.length < 2) return [];
     const nodeMap = new Map(nodes.map(n => [n.id, n]));
-    const seen = new Set<string>();
     const result: Array<{
-      x1: number; y1: number; x2: number; y2: number;
-      strokeWidth: number; color: string; opacity: number; dashed: boolean;
+      id: string;
+      path: string;
+      filamentPath: string;
+      coreColor: string;
+      glowColor: string;
+      strokeWidth: number;
+      opacity: number;
+      underOpacity: number;
+      dashed: boolean;
+      strength: number;
+      shimmerSpeed: number;
     }> = [];
 
     const edgeKey = (a: string, b: string) => a < b ? `${a}|${b}` : `${b}|${a}`;
+    const connectionMap = new Map<string, {
+      a: string;
+      b: string;
+      explicitCount: number;
+      sharedChapters: number;
+      sameFaction: boolean;
+      description?: string;
+      involvesProtagonist: boolean;
+    }>();
 
-    for (const c of characters) {
+    const ensureConnection = (a: string, b: string) => {
+      const key = edgeKey(a, b);
+      const current = connectionMap.get(key);
+      if (current) return current;
+      const created = {
+        a,
+        b,
+        explicitCount: 0,
+        sharedChapters: 0,
+        sameFaction: false,
+        description: undefined as string | undefined,
+        involvesProtagonist: protagonist ? a === protagonist.id || b === protagonist.id : false,
+      };
+      connectionMap.set(key, created);
+      return created;
+    };
+
+    for (const c of safeCharacters) {
       for (const rel of c.relationships) {
-        const key = edgeKey(c.id, rel.characterId);
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const na = nodeMap.get(c.id), nb = nodeMap.get(rel.characterId);
-        if (!na || !nb) continue;
-        const color = getEdgeColor(rel.description);
-        result.push({
-          x1: na.x, y1: na.y, x2: nb.x, y2: nb.y,
-          strokeWidth: 2,
-          color,
-          opacity: color === '#C5A059' ? 0.7 : color === '#ef4444' ? 0.65 : 0.45,
-          dashed: false,
-        });
+        const target = safeCharacters.find(other => other.id === rel.characterId);
+        if (!target) continue;
+        const connection = ensureConnection(c.id, rel.characterId);
+        connection.explicitCount += 1;
+        connection.sameFaction = connection.sameFaction || Boolean(c.faction && target.faction && c.faction === target.faction);
+        connection.description = connection.description ?? rel.description ?? getRelDesc(c, target);
       }
     }
 
-    // Shared-chapter weak connections (protagonist to everyone)
-    if (protagonist) {
-      const protNode = nodeMap.get(protagonist.id);
-      if (protNode) {
-        for (const c of characters) {
-          if (c.id === protagonist.id) continue;
-          const key = edgeKey(protagonist.id, c.id);
-          if (seen.has(key)) continue;
-          const shared = protagonist.chapters.filter(ch => c.chapters.includes(ch)).length;
-          if (shared === 0) continue;
-          seen.add(key);
-          const nb = nodeMap.get(c.id);
-          if (!nb) continue;
-          result.push({
-            x1: protNode.x, y1: protNode.y, x2: nb.x, y2: nb.y,
-            strokeWidth: Math.min(shared * 0.6, 2),
-            color: '#78716c',
-            opacity: 0.28 + shared * 0.06,
-            dashed: true,
-          });
-        }
+    for (let i = 0; i < safeCharacters.length; i++) {
+      for (let j = i + 1; j < safeCharacters.length; j++) {
+        const a = safeCharacters[i];
+        const b = safeCharacters[j];
+        const sharedChapters = a.chapters.filter(ch => b.chapters.includes(ch)).length;
+        const sameFaction = Boolean(a.faction && b.faction && a.faction === b.faction);
+        if (sharedChapters === 0 && !sameFaction) continue;
+        const connection = ensureConnection(a.id, b.id);
+        connection.sharedChapters = Math.max(connection.sharedChapters, sharedChapters);
+        connection.sameFaction = connection.sameFaction || sameFaction;
       }
     }
+
+    for (const [key, connection] of connectionMap) {
+      const na = nodeMap.get(connection.a);
+      const nb = nodeMap.get(connection.b);
+      if (!na || !nb) continue;
+
+      const strength =
+        connection.explicitCount * 2.2 +
+        connection.sharedChapters * 0.75 +
+        (connection.sameFaction ? 1.1 : 0) +
+        (connection.involvesProtagonist ? 0.55 : 0);
+
+      if (strength <= 0) continue;
+
+      const baseColor = getEdgeColor(connection.description);
+      const coreColor =
+        connection.sameFaction && baseColor === '#78716c'
+          ? '#8b7d63'
+          : baseColor;
+      const glowColor =
+        coreColor === '#ef4444'
+          ? 'rgba(239, 68, 68, 0.28)'
+          : coreColor === '#C5A059'
+          ? 'rgba(197, 160, 89, 0.32)'
+          : 'rgba(168, 162, 158, 0.18)';
+
+      const anchors = getEdgeAnchors(na, nb);
+      const path = buildThreadPath(
+        anchors.x1,
+        anchors.y1,
+        anchors.x2,
+        anchors.y2,
+        hashPair(connection.a, connection.b),
+        strength,
+      );
+      const filamentPath = buildThreadPath(
+        anchors.x1,
+        anchors.y1,
+        anchors.x2,
+        anchors.y2,
+        hashPair(connection.a, connection.b) + 11,
+        Math.max(strength - 0.8, 0.6),
+      );
+
+      result.push({
+        id: key,
+        path,
+        filamentPath,
+        coreColor,
+        glowColor,
+        strokeWidth: Math.min(1.2 + strength * 0.42, 4.6),
+        opacity: Math.min(0.26 + strength * 0.08, 0.9),
+        underOpacity: Math.min(0.1 + strength * 0.04, 0.32),
+        dashed: connection.explicitCount === 0,
+        strength,
+        shimmerSpeed: Math.max(6.5 - Math.min(strength, 4), 2.8),
+      });
+    }
+
+    result.sort((a, b) => a.strength - b.strength);
 
     return result;
-  }, [nodes, characters, protagonist]);
+  }, [nodes, safeCharacters, protagonist]);
 
   return (
     <div
       ref={containerRef}
-      className="relative w-full rounded-xl border border-stone-800 bg-stone-dark overflow-hidden shadow-2xl select-none"
+      className={`relative w-full rounded-xl border border-stone-800 bg-stone-dark overflow-hidden shadow-2xl select-none ${dragRef.current ? 'cursor-grabbing' : 'cursor-grab'}`}
       style={{ height: 680 }}
+      onWheel={handleWheel}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={endDrag}
+      onPointerLeave={() => dragRef.current && endDrag()}
     >
-      {/* Background glow */}
-      <div className="absolute inset-0 pointer-events-none opacity-25 bg-[radial-gradient(ellipse_at_center,rgba(197,160,89,0.2)_0%,transparent_70%)]" />
+      <div
+        className="absolute inset-0"
+        style={{
+          transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`,
+          transformOrigin: '0 0',
+        }}
+      >
+        {/* Background glow */}
+        <div className="absolute inset-0 pointer-events-none opacity-25 bg-[radial-gradient(ellipse_at_center,rgba(197,160,89,0.2)_0%,transparent_70%)]" />
 
-      {/* Ambient star particles */}
-      <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ overflow: 'visible' }}>
-        {particles.map((p, i) => (
-          <circle key={i} cx={p.x} cy={p.y} r={p.r} fill="#C5A059" opacity={p.op} />
-        ))}
-      </svg>
+        {/* Ambient star particles */}
+        <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ overflow: 'visible' }}>
+          {particles.map((p, i) => (
+            <circle key={i} cx={p.x} cy={p.y} r={p.r} fill="#C5A059" opacity={p.op} />
+          ))}
+        </svg>
 
-      {/* Orbit guide rings around protagonist */}
-      {protagonist && (() => {
-        const pp = positions.get(protagonist.id);
-        if (!pp) return null;
-        return (
-          <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ overflow: 'visible' }}>
-            {[130, 210, 300].map((r, i) => (
-              <circle key={i} cx={pp.x} cy={pp.y} r={r}
-                fill="none" stroke="#C5A059"
-                strokeWidth={0.5} strokeDasharray={i === 0 ? '4 8' : i === 1 ? '2 10' : '1 14'}
-                opacity={0.10 - i * 0.02}
-              />
-            ))}
-          </svg>
-        );
-      })()}
+        {/* Orbit guide rings around protagonist */}
+        {protagonist && (() => {
+          const pp = positions.get(protagonist.id);
+          if (!pp) return null;
+          return (
+            <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ overflow: 'visible' }}>
+              {[130, 210, 300].map((r, i) => (
+                <circle key={i} cx={pp.x} cy={pp.y} r={r}
+                  fill="none" stroke="#C5A059"
+                  strokeWidth={0.5} strokeDasharray={i === 0 ? '4 8' : i === 1 ? '2 10' : '1 14'}
+                  opacity={0.10 - i * 0.02}
+                />
+              ))}
+            </svg>
+          );
+        })()}
 
-      {/* SVG layer: edges only */}
-      <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ overflow: 'visible' }}>
+        {/* SVG layer: edges only */}
+        <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ overflow: 'visible' }}>
         <defs>
           <marker id="arrow-gold" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
             <path d="M0,0 L6,3 L0,6 Z" fill="#C5A05966" />
@@ -354,40 +553,91 @@ const ConstellationView: React.FC<{
             <feGaussianBlur stdDeviation="6" result="blur" />
             <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
           </filter>
+          <filter id="edge-soft-glow">
+            <feGaussianBlur stdDeviation="5.5" result="blur" />
+            <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+          </filter>
         </defs>
 
         {edges.map((e, i) => (
-          <line
-            key={i}
-            x1={e.x1} y1={e.y1}
-            x2={e.x2} y2={e.y2}
-            stroke={e.color}
-            strokeWidth={e.strokeWidth}
-            strokeOpacity={e.opacity}
-            strokeDasharray={e.dashed ? '6 5' : undefined}
-            strokeLinecap="round"
-            filter={!e.dashed && e.color !== '#78716c' ? 'url(#edge-glow)' : undefined}
-          />
+          <g key={e.id ?? i}>
+            <path
+              d={e.filamentPath}
+              fill="none"
+              stroke={e.glowColor}
+              strokeWidth={Math.max(0.8, e.strokeWidth * 0.42)}
+              strokeOpacity={Math.min(e.underOpacity * 0.9, 0.24)}
+              strokeLinecap="round"
+              strokeDasharray={e.dashed ? '2 10' : undefined}
+            />
+            <path
+              d={e.path}
+              fill="none"
+              stroke={e.glowColor}
+              strokeWidth={e.strokeWidth + 4.4}
+              strokeOpacity={e.underOpacity}
+              strokeLinecap="round"
+              filter="url(#edge-soft-glow)"
+            />
+            <path
+              d={e.path}
+              fill="none"
+              stroke={e.coreColor}
+              strokeWidth={e.strokeWidth + 1.15}
+              strokeOpacity={Math.min(e.opacity * 0.5, 0.42)}
+              strokeLinecap="round"
+              filter={!e.dashed && e.coreColor !== '#78716c' ? 'url(#edge-glow)' : undefined}
+            />
+            <path
+              d={e.path}
+              fill="none"
+              stroke={e.coreColor}
+              strokeWidth={e.strokeWidth}
+              strokeOpacity={e.opacity}
+              strokeDasharray={e.dashed ? '4 10' : undefined}
+              strokeLinecap="round"
+            />
+            {e.strength >= 2.6 && (
+              <motion.path
+                d={e.path}
+                fill="none"
+                stroke="rgba(255,255,255,0.55)"
+                strokeWidth={Math.max(0.8, e.strokeWidth * 0.34)}
+                strokeLinecap="round"
+                strokeDasharray="10 56"
+                initial={{ strokeDashoffset: 0, opacity: 0.12 }}
+                animate={{ strokeDashoffset: [-66, 0], opacity: [0.12, 0.28, 0.12] }}
+                transition={{ duration: e.shimmerSpeed, repeat: Infinity, ease: 'linear' }}
+              />
+            )}
+          </g>
         ))}
-      </svg>
+        </svg>
 
-      {/* Character nodes */}
-      {nodes.map((node, i) => {
+        {/* Character nodes */}
+        {nodes.map((node, i) => {
         const isProto = node.erole === 'Protagonista';
         const isAntag = node.erole === 'Antagonista';
         const isHov = hovered === node.id;
         const charState = universe.narrativeMemory?.characterStates?.find(
           s => s.characterId === node.id,
         );
+        const lastChapterId = node.chapters[node.chapters.length - 1];
+        const lastChapter = lastChapterId
+          ? universe.chapters.find(chapter => chapter.id === lastChapterId)
+          : undefined;
         const relWithProt = protagonist && node.id !== protagonist.id
           ? getRelDesc(protagonist, node as Character)
           : undefined;
         const isDead = charState?.status === 'Morto' || node.status === 'Morto';
         const showRole = isProto || isAntag || node.erole === 'Mentor';
+        const statusLabel = isDead ? 'Morto' : charState?.status || node.status || 'Ativo';
+        const statusTone = isDead ? 'bg-red-950/80 text-red-200 border-red-500/40' : 'bg-emerald-950/75 text-emerald-200 border-emerald-500/30';
 
-        return (
-          <motion.div
-            key={node.id}
+          return (
+            <motion.div
+              key={node.id}
+            data-node="true"
             className="absolute cursor-pointer flex flex-col items-center"
             style={{
               left: node.x,
@@ -488,6 +738,9 @@ const ConstellationView: React.FC<{
                   {isProto ? t('chars.constellation.protagonist') : node.erole}
                 </p>
               )}
+              <div className={`mt-1 inline-flex items-center rounded-full border px-2 py-0.5 text-[8px] font-semibold uppercase tracking-[0.22em] ${statusTone}`}>
+                {statusLabel}
+              </div>
             </div>
 
             {/* Hover tooltip */}
@@ -503,6 +756,9 @@ const ConstellationView: React.FC<{
                 {charState?.emotionalState && (
                   <p className="text-stone-400 text-[9px] mb-1 italic">{charState.emotionalState}</p>
                 )}
+                {lastChapter && (
+                  <p className="text-stone-400 text-[9px] mb-1">{t('chars.constellation.lastAppearance')}: {lastChapter.title}</p>
+                )}
                 {relWithProt && (
                   <div className="border-t border-stone-700 pt-1.5 mt-1.5">
                     <p className="text-[8px] uppercase tracking-widest text-stone-600 mb-0.5">{t('chars.constellation.relation')}</p>
@@ -513,10 +769,11 @@ const ConstellationView: React.FC<{
             )}
           </motion.div>
         );
-      })}
+        })}
+      </div>
 
       {/* Legend */}
-      <div className="absolute bottom-4 left-4 bg-stone-900/80 backdrop-blur-sm border border-stone-800 rounded-xl px-3 py-2.5 space-y-1.5">
+      <div data-constellation-ui="true" className="absolute bottom-4 left-4 bg-stone-900/80 backdrop-blur-sm border border-stone-800 rounded-xl px-3 py-2.5 space-y-1.5">
         <p className="text-[8px] uppercase tracking-widest text-stone-600 mb-1">{t('chars.constellation.legend')}</p>
         {(
           [
@@ -548,9 +805,54 @@ const ConstellationView: React.FC<{
         </div>
       </div>
 
+      <div data-constellation-ui="true" className="absolute left-4 top-4 grid gap-2 sm:grid-cols-3">
+        {[
+          { label: t('chars.constellation.active'), value: activeCount, tone: 'border-nobel/30 bg-stone-900/70 text-nobel' },
+          { label: t('chars.constellation.alive'), value: aliveCount, tone: 'border-emerald-500/20 bg-emerald-950/45 text-emerald-200' },
+          { label: t('chars.constellation.dead'), value: deadCount, tone: 'border-red-500/20 bg-red-950/45 text-red-200' },
+        ].map(item => (
+          <div key={item.label} className={`rounded-xl border px-3 py-2 backdrop-blur-sm ${item.tone}`}>
+            <p className="text-[8px] uppercase tracking-[0.25em] opacity-70">{item.label}</p>
+            <p className="mt-1 font-serif text-lg font-bold">{item.value}</p>
+          </div>
+        ))}
+      </div>
+
+      <div data-constellation-ui="true" className="absolute right-4 bottom-4 flex items-center gap-2 rounded-2xl border border-stone-700/80 bg-stone-950/80 px-3 py-2 shadow-2xl backdrop-blur-sm">
+        <button
+          type="button"
+          onClick={() => setViewport(prev => ({ ...prev, scale: Math.max(0.72, prev.scale - 0.12) }))}
+          className="rounded-lg border border-stone-700 bg-stone-900/80 p-2 text-stone-200 transition hover:border-stone-500 hover:text-white"
+          aria-label="Zoom out"
+        >
+          <Minus className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          onClick={() => setViewport(prev => ({ ...prev, scale: Math.min(1.9, prev.scale + 0.12) }))}
+          className="rounded-lg border border-stone-700 bg-stone-900/80 p-2 text-stone-200 transition hover:border-stone-500 hover:text-white"
+          aria-label="Zoom in"
+        >
+          <Plus className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          onClick={() => setViewport({ x: 0, y: 0, scale: 1 })}
+          className="rounded-lg border border-stone-700 bg-stone-900/80 p-2 text-stone-200 transition hover:border-stone-500 hover:text-white"
+          aria-label="Reset view"
+        >
+          <LocateFixed className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
       {/* Counter */}
-      <div className="absolute top-4 right-4 text-[9px] text-stone-700">
-        {characters.length} {characters.length === 1 ? t('chars.constellation.entity') : t('chars.constellation.entities')} · {t('chars.constellation.clickDetails')}
+      <div data-constellation-ui="true" className="absolute right-4 top-4 rounded-2xl border border-stone-700/80 bg-stone-950/80 px-4 py-3 text-right shadow-2xl backdrop-blur-sm">
+        <p className="text-[8px] uppercase tracking-[0.28em] text-stone-500">{t('chars.constellation.liveWeb')}</p>
+        <p className="mt-1 font-serif text-sm font-bold text-stone-100">
+          {characters.length} {characters.length === 1 ? t('chars.constellation.entity') : t('chars.constellation.entities')}
+        </p>
+        <p className="mt-1 text-[9px] text-stone-400">{t('chars.constellation.clickDetails')}</p>
+        <p className="mt-1 text-[9px] text-stone-500">{Math.round(viewport.scale * 100)}%</p>
       </div>
     </div>
   );
@@ -561,21 +863,27 @@ const CharacterDetailModal: React.FC<{
     onClose: () => void; 
     onGenerateImage: (prompt: string) => void;
     onUpdateCharacterImage?: (characterId: string, prompt: string) => void;
+    onSaveCharacter?: (character: Character) => void;
     isLoading: boolean;
-}> = ({ character, onClose, onGenerateImage, onUpdateCharacterImage, isLoading }) => {
+}> = ({ character, onClose, onGenerateImage, onUpdateCharacterImage, onSaveCharacter, isLoading }) => {
     const { t } = useLanguage();
+    const [draft, setDraft] = useState<Character | null>(character);
+    useEffect(() => {
+        setDraft(character);
+    }, [character]);
     if (!character) return null;
+    const current = draft ?? character;
 
     return (
         <Modal isOpen={!!character} onClose={onClose} title={character.name}>
             <div className="flex flex-col md:flex-row gap-6">
                 <div className="md:w-1/3 flex-shrink-0">
-              <CharacterPortrait name={character.name} imageUrl={character.imageUrl} role={character.role} faction={character.faction} size={768} className="w-full h-auto object-cover rounded-lg shadow-md border border-stone-200 aspect-[4/5]" />
+              <CharacterPortrait name={current.name} imageUrl={current.imageUrl} role={current.role} faction={current.faction} size={768} className="w-full h-auto object-cover rounded-lg shadow-md border border-stone-200 aspect-[4/5]" />
                      <Button 
                         onClick={() => {
-                            const prompt = `${t('chars.genImagePrompt')} ${character.name}, ${character.bio.substring(0, 100)}...`;
+                            const prompt = `${t('chars.genImagePrompt')} ${current.name}, ${current.bio.substring(0, 100)}...`;
                             if (onUpdateCharacterImage) {
-                                onUpdateCharacterImage(character.id, prompt);
+                                onUpdateCharacterImage(current.id, prompt);
                             } else {
                                 onGenerateImage(prompt);
                             }
@@ -593,26 +901,62 @@ const CharacterDetailModal: React.FC<{
                         <h4 className="font-serif font-bold text-lg mb-4 text-stone-dark border-b border-stone-200 pb-2">{t('chars.basicSheet')}</h4>
                         <div className="grid grid-cols-2 gap-4 text-sm">
                             <div>
+                                <p className="text-xs uppercase tracking-widest text-stone-400 mb-1">{t('chars.field.name')}</p>
+                                <input className="w-full rounded-lg border border-stone-300 px-2 py-1.5" value={current.name} onChange={e => setDraft(prev => prev ? { ...prev, name: e.target.value } : prev)} />
+                            </div>
+                            <div>
+                                <p className="text-xs uppercase tracking-widest text-stone-400 mb-1">{t('chars.field.aliases')}</p>
+                                <input className="w-full rounded-lg border border-stone-300 px-2 py-1.5" value={current.aliases.join(', ')} onChange={e => setDraft(prev => prev ? { ...prev, aliases: e.target.value.split(',').map(alias => alias.trim()).filter(Boolean) } : prev)} />
+                            </div>
+                            <div>
                                 <p className="text-xs uppercase tracking-widest text-stone-400 mb-1">{t('chars.age')}</p>
-                                <p className="font-medium text-stone-800">{character.age}</p>
+                                <input type="number" className="w-full rounded-lg border border-stone-300 px-2 py-1.5" value={current.age} onChange={e => setDraft(prev => prev ? { ...prev, age: Number(e.target.value) } : prev)} />
                             </div>
                             <div>
                                 <p className="text-xs uppercase tracking-widest text-stone-400 mb-1">{t('chars.role')}</p>
-                                <p className="font-medium text-stone-800">{character.role}</p>
+                                <input className="w-full rounded-lg border border-stone-300 px-2 py-1.5" value={current.role} onChange={e => setDraft(prev => prev ? { ...prev, role: e.target.value as Character['role'] } : prev)} />
                             </div>
                             <div>
                                 <p className="text-xs uppercase tracking-widest text-stone-400 mb-1">{t('chars.alignment')}</p>
-                                <p className="font-medium text-stone-800">{character.alignment}</p>
+                                <input className="w-full rounded-lg border border-stone-300 px-2 py-1.5" value={current.alignment} onChange={e => setDraft(prev => prev ? { ...prev, alignment: e.target.value } : prev)} />
                             </div>
                             <div>
                                 <p className="text-xs uppercase tracking-widest text-stone-400 mb-1">{t('chars.status')}</p>
-                                <p className="font-medium text-stone-800">{character.status}</p>
+                                <select className="w-full rounded-lg border border-stone-300 px-2 py-1.5" value={current.status} onChange={e => setDraft(prev => prev ? { ...prev, status: e.target.value as Character['status'] } : prev)}>
+                                    <option value="Vivo">{t('chars.status.alive')}</option>
+                                    <option value="Morto">{t('chars.status.dead')}</option>
+                                    <option value="Desconhecido">{t('chars.status.unknown')}</option>
+                                </select>
+                            </div>
+                            <div>
+                                <p className="text-xs uppercase tracking-widest text-stone-400 mb-1">Facção</p>
+                                <input className="w-full rounded-lg border border-stone-300 px-2 py-1.5" value={current.faction} onChange={e => setDraft(prev => prev ? { ...prev, faction: e.target.value } : prev)} />
+                            </div>
+                            <div>
+                                <p className="text-xs uppercase tracking-widest text-stone-400 mb-1">{t('chars.field.aiVisibility')}</p>
+                                <select className="w-full rounded-lg border border-stone-300 px-2 py-1.5" value={current.aiVisibility} onChange={e => setDraft(prev => prev ? { ...prev, aiVisibility: e.target.value as Character['aiVisibility'] } : prev)}>
+                                    <option value="global">{t('chars.visibility.global')}</option>
+                                    <option value="tracked">{t('chars.visibility.tracked')}</option>
+                                    <option value="hidden">{t('chars.visibility.hidden')}</option>
+                                </select>
                             </div>
                         </div>
                     </Card>
                     <Card className="p-6">
                         <h4 className="font-serif font-bold text-lg mb-4 text-stone-dark border-b border-stone-200 pb-2">{t('chars.bio')}</h4>
-                        <p className="text-stone-600 leading-relaxed font-serif">{character.bio}</p>
+                        <textarea className="w-full h-32 rounded-xl border border-stone-300 px-3 py-2 resize-none text-stone-700" value={current.bio} onChange={e => setDraft(prev => prev ? { ...prev, bio: e.target.value } : prev)} />
+                        <div className="mt-4">
+                            <label className="block text-xs uppercase tracking-widest text-stone-400 mb-1">{t('chars.field.authorNotes')}</label>
+                            <textarea className="w-full h-24 rounded-xl border border-stone-300 px-3 py-2 resize-none text-stone-700" value={current.notesPrivate ?? ''} onChange={e => setDraft(prev => prev ? { ...prev, notesPrivate: e.target.value } : prev)} />
+                        </div>
+                    </Card>
+                    <Card className="p-4">
+                        <div className="flex justify-end">
+                            <Button size="sm" onClick={() => draft && onSaveCharacter?.(draft)}>
+                                <Save className="mr-2 h-4 w-4" />
+                                {t('common.save')}
+                            </Button>
+                        </div>
                     </Card>
                 </div>
             </div>
@@ -621,10 +965,18 @@ const CharacterDetailModal: React.FC<{
 };
 
 
-export default function CharactersView({ universe, onGenerateCharacter, onGenerateImage, onUpdateCharacterImage, isLoading }: CharactersViewProps) {
+export default function CharactersView({ universe, onGenerateCharacter, onGenerateImage, onUpdateCharacterImage, onUpdateUniverse, isLoading }: CharactersViewProps) {
   const { t } = useLanguage();
   const [selectedCharacter, setSelectedCharacter] = useState<Character | null>(null);
   const [viewMode, setViewMode] = useState<'grid' | 'constellation'>('grid');
+  const handleSaveCharacter = useCallback((character: Character) => {
+      const updatedUniverse = markUniverseDirty({
+          ...universe,
+          characters: universe.characters.map(existing => existing.id === character.id ? character : existing),
+      }, ['characters']);
+      onUpdateUniverse?.(updatedUniverse);
+      setSelectedCharacter(character);
+  }, [onUpdateUniverse, universe]);
 
   // Update selected character if universe changes (e.g., image updated)
   React.useEffect(() => {
@@ -673,7 +1025,7 @@ export default function CharactersView({ universe, onGenerateCharacter, onGenera
             ))}
             </div>
         ) : (
-            <ConstellationView characters={universe.characters} universe={universe} onSelect={setSelectedCharacter} t={t} />
+            <RelationshipConstellation characters={universe.characters} universe={universe} onSelect={setSelectedCharacter} t={t} />
         )
       ) : (
         <div className="text-center py-24 bg-stone-50 rounded-xl border border-stone-200 border-dashed">
@@ -688,6 +1040,7 @@ export default function CharactersView({ universe, onGenerateCharacter, onGenera
         onClose={() => setSelectedCharacter(null)}
         onGenerateImage={onGenerateImage}
         onUpdateCharacterImage={onUpdateCharacterImage}
+        onSaveCharacter={handleSaveCharacter}
         isLoading={isLoading}
       />
     </div>

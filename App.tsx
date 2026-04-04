@@ -5,7 +5,6 @@ import { LanguageProvider } from './LanguageContext';
 import Sidebar from './components/Sidebar';
 import Dashboard from './components/Dashboard';
 import CodexView from './components/CodexView';
-import CharactersView from './components/CharactersView';
 import ChaptersView from './components/ChaptersView';
 import AssetsView from './components/AssetsView';
 import AgentsView from './components/AgentsView';
@@ -14,7 +13,7 @@ import Toast from './components/ui/Toast';
 import LandingPage from './components/LandingPage';
 import AgentThinkingPanel from './components/ui/AgentThinkingPanel';
 import ApiKeyModal from './components/ui/ApiKeyModal';
-import { generateDivineGenesis, createNewUniverse, generateCharacter, generateImage, generateStoryArc } from './services/geminiService';
+import { generateDivineGenesis, createNewUniverse, generateCharacter, generateImage, generateStoryArc, syncUniverseCanon } from './services/geminiService';
 import type { AutogenProgress } from './services/geminiService';
 import { createPortraitUrl } from './utils/portraits';
 import { EMPTY_API_KEYS, hasAllApiKeys, loadApiKeys, saveApiKeys } from './utils/apiKeys';
@@ -63,7 +62,7 @@ export default function App() {
     setIsLoading(true);
     try {
       const newUniverse = await createNewUniverse({ name, description });
-      setUniverse(newUniverse);
+      setUniverse(syncUniverseCanon(newUniverse, 'light'));
       setCurrentView('dashboard');
       showToast('Universo iniciado! Agora adicione personagens.');
     } catch (error) {
@@ -81,7 +80,7 @@ export default function App() {
     try {
       const storyLang = profile.lang ?? (localStorage.getItem('mythos-lang') as 'pt' | 'en') ?? 'pt';
       const newUniverse = await generateDivineGenesis(profile, (step: string) => setGenesisStep(step as GenerationStep), storyLang);
-      setUniverse(newUniverse);
+      setUniverse(syncUniverseCanon(newUniverse, 'light'));
       setCurrentView('dashboard');
       showToast('Genesis Completo: Universo criado com sucesso!');
     } catch (error) {
@@ -103,31 +102,34 @@ export default function App() {
     try {
       const storyLang = profile.lang ?? (localStorage.getItem('mythos-lang') as 'pt' | 'en') ?? 'pt';
       const newUniverse = await generateDivineGenesis(profile, (step: string) => setGenesisStep(step as GenerationStep), storyLang, 'economy');
-      setUniverse(newUniverse);
+      const preparedUniverse = syncUniverseCanon(newUniverse, 'light');
+      setUniverse(preparedUniverse);
       setGenesisStep('idle');
 
       const baseParams = {
         title: '',
         plotDirection: '',
-        activeCharacterIds: newUniverse.characters.map(c => c.id),
+        activeCharacterIds: preparedUniverse.characters.map(c => c.id),
         tone: 'Épico' as const,
         focus: 'Ação' as const,
         lang: storyLang,
         qualityMode: 'economy' as const,
       };
 
+      const remainingChapters = Math.max(0, chaptersCount - preparedUniverse.chapters.length);
+
       const finalUniverse = await generateStoryArc(
-        newUniverse,
-        chaptersCount,
+        preparedUniverse,
+        remainingChapters,
         baseParams,
         (p) => {
           setAutoGenProgress(p);
-          setUniverse(p.currentUniverse);
+          setUniverse(syncUniverseCanon(p.currentUniverse, 'light'));
         },
         controller.signal,
       );
 
-      setUniverse(finalUniverse);
+      setUniverse(syncUniverseCanon(finalUniverse, 'light'));
       setCurrentView('chapters');
       showToast(`AutoGen completo: ${finalUniverse.chapters.length} capítulos gerados!`);
     } catch (error) {
@@ -218,12 +220,12 @@ export default function App() {
   }, [universe]);
 
   const handleUpdateUniverse = (updatedUniverse: Universe) => {
-      setUniverse(updatedUniverse);
+      setUniverse(syncUniverseCanon(updatedUniverse, 'light'));
       showToast('Configurações salvas com sucesso!', 'success');
   };
 
   const handleUpdateUniverseSilent = useCallback((updatedUniverse: Universe) => {
-      setUniverse(updatedUniverse);
+      setUniverse(syncUniverseCanon(updatedUniverse, 'light'));
   }, []);
 
   const handleExportUniverse = useCallback(() => {
@@ -245,7 +247,7 @@ export default function App() {
       reader.onload = (e) => {
           try {
               const imported = JSON.parse(e.target?.result as string) as Universe;
-              setUniverse(imported);
+              setUniverse(syncUniverseCanon(imported, 'light'));
               setCurrentView('dashboard');
               showToast('Universo importado com sucesso!');
           } catch {
@@ -283,9 +285,9 @@ export default function App() {
           setCurrentView={setCurrentView}
         />;
       case 'codex':
-        return <CodexView universe={universe} isLoading={isLoading} />;
+        return <CodexView universe={universe} onUpdateUniverse={handleUpdateUniverse} isLoading={isLoading} initialSection="overview" />;
       case 'characters':
-        return <CharactersView universe={universe} onGenerateCharacter={handleGenerateSingleCharacter} onGenerateImage={handleGenerateImage} onUpdateCharacterImage={handleUpdateCharacterImage} isLoading={isLoading} />;
+        return <CodexView universe={universe} onUpdateUniverse={handleUpdateUniverse} isLoading={isLoading} initialSection="characters" />;
       case 'chapters':
         return <ChaptersView universe={universe} onGenerateChapter={handleGenerateChapter} onUpdateUniverse={handleUpdateUniverseSilent} isLoading={isLoading} />;
       case 'assets':
