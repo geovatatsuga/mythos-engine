@@ -1,6 +1,6 @@
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import type { View, Universe, ToastMessage, GenerationStep, StoryProfile } from './types';
+import type { View, Universe, ToastMessage, GenerationStep, StoryProfile, LongformBlueprint } from './types';
 import { LanguageProvider } from './LanguageContext';
 import Sidebar from './components/Sidebar';
 import Dashboard from './components/Dashboard';
@@ -14,7 +14,7 @@ import LandingPage from './components/LandingPage';
 import AgentThinkingPanel from './components/ui/AgentThinkingPanel';
 import ApiKeyModal from './components/ui/ApiKeyModal';
 import ErrorBoundary, { type BoundaryErrorDetails } from './components/ui/ErrorBoundary';
-import { generateDivineGenesis, createNewUniverse, generateCharacter, generateImage, generateStoryArc, syncUniverseCanon } from './services/geminiService';
+import { generateDivineGenesis, generateLongformGenesisBase, createNewUniverse, generateCharacter, generateImage, generateLongformBlueprint, runAutogenLongform, syncUniverseCanon } from './services/geminiService';
 import type { AutogenProgress } from './services/geminiService';
 import { createPortraitUrl } from './utils/portraits';
 import { EMPTY_API_KEYS, hasAllApiKeys, loadApiKeys, saveApiKeys } from './utils/apiKeys';
@@ -23,6 +23,11 @@ interface RuntimeIssue {
   source: 'render' | 'window' | 'promise' | 'agent-panel';
   message: string;
   stack?: string;
+}
+
+interface PendingLongformRun {
+  universe: Universe;
+  blueprint: LongformBlueprint;
 }
 
 export default function App() {
@@ -35,6 +40,7 @@ export default function App() {
   const [genesisStep, setGenesisStep] = useState<GenerationStep>('idle');
   const [toast, setToast] = useState<ToastMessage | null>(null);
   const [autoGenProgress, setAutoGenProgress] = useState<AutogenProgress | null>(null);
+  const [pendingLongformRun, setPendingLongformRun] = useState<PendingLongformRun | null>(null);
   const [runtimeIssue, setRuntimeIssue] = useState<RuntimeIssue | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const apiKeysReady = hasAllApiKeys(apiKeys);
@@ -138,34 +144,66 @@ export default function App() {
     }
   }, []);
 
-  // AutoGen: divine genesis + sequential chapter generation
-  const handleAutoGen = useCallback(async (profile: StoryProfile, chaptersCount: number) => {
+  const handleAutoGenLongform = useCallback(async (profile: StoryProfile) => {
     setIsLoading(true);
     setGenesisStep('anchors');
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
     try {
       const storyLang = profile.lang ?? (localStorage.getItem('mythos-lang') as 'pt' | 'en') ?? 'pt';
-      const newUniverse = await generateDivineGenesis(profile, (step: string) => setGenesisStep(step as GenerationStep), storyLang, 'economy');
+      const newUniverse = await generateLongformGenesisBase(profile, (step: string) => setGenesisStep(step as GenerationStep), storyLang, 'economy');
       const preparedUniverse = syncUniverseCanon(newUniverse, 'light');
-      setUniverse(preparedUniverse);
+      const blueprint = await generateLongformBlueprint(preparedUniverse, 'economy');
+      const stagedUniverse = {
+        ...preparedUniverse,
+        creationMode: 'autogen_longform' as const,
+        longformBlueprint: blueprint,
+      };
+      setUniverse(stagedUniverse);
+      setCurrentView('dashboard');
+      setPendingLongformRun({ universe: stagedUniverse, blueprint });
+      showToast(storyLang === 'pt' ? 'Blueprint da obra pronto para aprovação.' : 'Longform blueprint ready for approval.');
+    } catch (error) {
+      console.error(error);
+      const msg = error instanceof Error ? error.message : 'Falha no AutoGen.';
+      showToast(msg, 'error');
+    } finally {
+      setIsLoading(false);
       setGenesisStep('idle');
+    }
+  }, []);
 
+  const handleConfirmAutoGen = useCallback(async () => {
+    if (!pendingLongformRun) return;
+
+    setIsLoading(true);
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    const preparedUniverse = pendingLongformRun.universe;
+    const blueprint = pendingLongformRun.blueprint;
+    try {
+      const storyLang = preparedUniverse.lang ?? preparedUniverse.storyProfile?.lang ?? 'pt';
       const baseParams = {
         title: '',
         plotDirection: '',
         activeCharacterIds: preparedUniverse.characters.map(c => c.id),
-        tone: 'Épico' as const,
+        tone: (preparedUniverse.storyProfile?.tone ?? 'Épico') as const,
         focus: 'Ação' as const,
         lang: storyLang,
         qualityMode: 'economy' as const,
       };
 
-      const remainingChapters = Math.max(0, chaptersCount - preparedUniverse.chapters.length);
+      setPendingLongformRun(null);
+      setCurrentView('dashboard');
+      setAutoGenProgress({
+        chaptersDone: 0,
+        totalChapters: blueprint.targetChapters,
+        phase: 'director',
+        currentUniverse: preparedUniverse,
+      });
+      setUniverse(preparedUniverse);
 
-      const finalUniverse = await generateStoryArc(
+      const finalUniverse = await runAutogenLongform(
         preparedUniverse,
-        remainingChapters,
+        blueprint,
         baseParams,
         (p) => {
           setAutoGenProgress(p);
@@ -176,9 +214,12 @@ export default function App() {
 
       setUniverse(syncUniverseCanon(finalUniverse, 'light'));
       setCurrentView('chapters');
-      showToast(`AutoGen completo: ${finalUniverse.chapters.length} capítulos gerados!`);
+      showToast(storyLang === 'pt'
+        ? `Obra completa iniciada: ${finalUniverse.chapters.length} capítulos gerados.`
+        : `Longform run complete: ${finalUniverse.chapters.length} chapters generated.`);
     } catch (error) {
       console.error(error);
+      setPendingLongformRun({ universe: preparedUniverse, blueprint });
       const msg = error instanceof Error ? error.message : 'Falha no AutoGen.';
       showToast(msg, 'error');
     } finally {
@@ -187,6 +228,10 @@ export default function App() {
       setAutoGenProgress(null);
       abortControllerRef.current = null;
     }
+  }, [pendingLongformRun]);
+
+  const handleCancelAutoGen = useCallback(() => {
+    setPendingLongformRun(null);
   }, []);
 
   const handleAbortAutoGen = useCallback(() => {
@@ -303,15 +348,37 @@ export default function App() {
   }, []);
 
   const renderContent = () => {
+    if (autoGenProgress && autoGenProgress.phase !== 'done') {
+      return (
+        <Dashboard
+          universe={universe}
+          onBuildUniverseManual={handleBuildUniverseManual}
+          onDivineGenesis={handleDivineGenesis}
+          onAutoGen={handleAutoGenLongform}
+          onConfirmAutoGen={handleConfirmAutoGen}
+          onCancelAutoGen={handleCancelAutoGen}
+          onAbortAutoGen={handleAbortAutoGen}
+          autoGenProgress={autoGenProgress}
+          pendingLongformRun={pendingLongformRun}
+          onImport={handleImportUniverse}
+          isLoading={isLoading}
+          genesisStep={genesisStep}
+        />
+      );
+    }
+
     if (!universe) {
       return (
         <Dashboard
           universe={null}
           onBuildUniverseManual={handleBuildUniverseManual}
           onDivineGenesis={handleDivineGenesis}
-          onAutoGen={handleAutoGen}
+          onAutoGen={handleAutoGenLongform}
+          onConfirmAutoGen={handleConfirmAutoGen}
+          onCancelAutoGen={handleCancelAutoGen}
           onAbortAutoGen={handleAbortAutoGen}
           autoGenProgress={autoGenProgress}
+          pendingLongformRun={pendingLongformRun}
           onImport={handleImportUniverse}
           isLoading={isLoading}
           genesisStep={genesisStep}
@@ -324,6 +391,9 @@ export default function App() {
         return <Dashboard 
           universe={universe} 
           isLoading={isLoading} 
+          onConfirmAutoGen={handleConfirmAutoGen}
+          onCancelAutoGen={handleCancelAutoGen}
+          pendingLongformRun={pendingLongformRun}
           onGenerateCharacter={handleGenerateSingleCharacter}
           onGenerateChapter={handleGenerateChapter}
           onExport={handleExportUniverse}
@@ -340,7 +410,14 @@ export default function App() {
       case 'agents':
         return <AgentsView universe={universe} onUpdateUniverse={handleUpdateUniverse} />;
       default:
-        return <Dashboard universe={universe} isLoading={isLoading} setCurrentView={setCurrentView} />;
+        return <Dashboard
+          universe={universe}
+          isLoading={isLoading}
+          onConfirmAutoGen={handleConfirmAutoGen}
+          onCancelAutoGen={handleCancelAutoGen}
+          pendingLongformRun={pendingLongformRun}
+          setCurrentView={setCurrentView}
+        />;
     }
   };
 

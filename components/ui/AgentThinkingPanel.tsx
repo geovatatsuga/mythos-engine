@@ -54,13 +54,16 @@ const fmt = (n: number) => n.toLocaleString('pt-BR');
 
 // ─── Agent card ──────────────────────────────────────────────────────────────
 
-const AgentCard: React.FC<{ event: AgentOutputEvent; tokenEvent?: TokenUsageEvent }> = ({ event, tokenEvent }) => {
+const AgentCard: React.FC<{ event: AgentOutputEvent; tokenEvents?: TokenUsageEvent[] }> = ({ event, tokenEvents = [] }) => {
   const [expanded, setExpanded] = useState(false);
   const meta = getMeta(event.agent);
   const Icon = meta.icon;
 
   const isThinking = event.status === 'thinking';
   const isError    = event.status === 'error';
+  const totalTokens = tokenEvents.reduce((sum, item) => sum + item.totalTokens, 0);
+  const providers = Array.from(new Set(tokenEvents.map(item => item.provider)));
+  const primaryTokenEvent = tokenEvents[tokenEvents.length - 1];
 
   return (
     <M.div
@@ -71,10 +74,10 @@ const AgentCard: React.FC<{ event: AgentOutputEvent; tokenEvent?: TokenUsageEven
       transition={{ type: 'spring', stiffness: 400, damping: 30 }}
       className={`relative rounded-xl border overflow-hidden transition-colors duration-300 ${
         isThinking
-          ? 'border-stone-300 bg-white shadow-md'
+          ? 'border-[#dbc89f] bg-[linear-gradient(180deg,rgba(255,252,246,0.96),rgba(250,244,232,0.96))] shadow-[0_18px_45px_rgba(128,96,51,0.10)]'
           : isError
-            ? 'border-red-300 bg-red-50'
-            : 'border-stone-200 bg-stone-50/80'
+            ? 'border-red-300 bg-red-50/95'
+            : 'border-[#e8dcc8] bg-[linear-gradient(180deg,rgba(255,255,255,0.92),rgba(248,243,236,0.9))]'
       }`}
     >
       {isThinking && (
@@ -91,7 +94,14 @@ const AgentCard: React.FC<{ event: AgentOutputEvent; tokenEvent?: TokenUsageEven
         onClick={() => !isThinking && setExpanded(prev => !prev)}
       >
         {/* Agent icon */}
-        <div className={`flex-shrink-0 w-9 h-9 rounded-lg ${meta.bg} flex items-center justify-center`}>
+        <div className={`relative flex-shrink-0 w-9 h-9 rounded-lg ${meta.bg} flex items-center justify-center`}>
+          {isThinking && (
+            <M.div
+              className="absolute inset-0 rounded-lg border border-current opacity-30"
+              animate={{ scale: [1, 1.18, 1], opacity: [0.18, 0.36, 0.18] }}
+              transition={{ repeat: Infinity, duration: 1.8, ease: 'easeInOut' }}
+            />
+          )}
           <Icon className={`w-5 h-5 ${meta.color}`} />
         </div>
 
@@ -105,24 +115,27 @@ const AgentCard: React.FC<{ event: AgentOutputEvent; tokenEvent?: TokenUsageEven
             <p className="text-xs text-stone-600 truncate mt-0.5">{event.summary}</p>
           )}
           {/* Token badge inline */}
-          {tokenEvent && (
+          {tokenEvents.length > 0 && primaryTokenEvent && (
             <div className="flex items-center gap-1.5 mt-1">
-              <span
-                className="text-[9px] font-bold px-1.5 py-0.5 rounded-full"
-                style={{
-                  background: `${PROVIDER_COLOR[tokenEvent.provider]}18`,
-                  color: PROVIDER_COLOR[tokenEvent.provider],
-                  border: `1px solid ${PROVIDER_COLOR[tokenEvent.provider]}33`,
-                }}
-              >
-                {PROVIDER_LABEL[tokenEvent.provider]}
+              {providers.map((provider) => (
+                <span
+                  key={provider}
+                  className="text-[9px] font-bold px-1.5 py-0.5 rounded-full"
+                  style={{
+                    background: `${PROVIDER_COLOR[provider]}18`,
+                    color: PROVIDER_COLOR[provider],
+                    border: `1px solid ${PROVIDER_COLOR[provider]}33`,
+                  }}
+                >
+                  {PROVIDER_LABEL[provider]}
+                </span>
+              ))}
+              <span className="max-w-[220px] truncate rounded-full border border-stone-200 bg-stone-100 px-1.5 py-0.5 text-[9px] font-mono text-stone-500">
+                {primaryTokenEvent.model}
               </span>
               <span className="text-[10px] text-stone-400 font-mono">
-                {fmt(tokenEvent.totalTokens)} tok
-                <span className="text-stone-300 mx-1">·</span>
-                <span className="text-stone-400">↑{fmt(tokenEvent.inputTokens)}</span>
-                <span className="text-stone-300 mx-0.5"> </span>
-                <span className="text-stone-400">↓{fmt(tokenEvent.outputTokens)}</span>
+                {fmt(totalTokens)} tok
+                {tokenEvents.length > 1 && <span className="text-stone-300 mx-1">· {tokenEvents.length} chamadas</span>}
               </span>
             </div>
           )}
@@ -161,6 +174,23 @@ const AgentCard: React.FC<{ event: AgentOutputEvent; tokenEvent?: TokenUsageEven
               <div className="bg-stone-100 rounded-lg p-3 text-xs font-mono text-stone-600 max-h-40 overflow-y-auto whitespace-pre-wrap leading-relaxed">
                 {event.detail}
               </div>
+              {tokenEvents.length > 1 && (
+                <div className="mt-2 rounded-lg border border-stone-200 bg-white p-3">
+                  <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.18em] text-stone-400">
+                    Providers usados nesta etapa
+                  </p>
+                  <div className="space-y-1.5">
+                    {tokenEvents.map((token, index) => (
+                      <div key={`${token.id}-${index}`} className="flex items-center justify-between gap-3 text-[10px] font-mono text-stone-500">
+                        <span className="truncate">
+                          {PROVIDER_LABEL[token.provider]} / {token.model}
+                        </span>
+                        <span className="shrink-0 text-stone-400">{fmt(token.totalTokens)} tok</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           </M.div>
         )}
@@ -177,7 +207,7 @@ const Connector: React.FC = () => (
 
 // ─── Build export text (includes token info) ─────────────────────────────────
 
-const buildExportText = (evs: AgentOutputEvent[], tokenMap: Map<string, TokenUsageEvent>): string => {
+const buildExportText = (evs: AgentOutputEvent[], tokenMap: Map<string, TokenUsageEvent[]>): string => {
   const done = evs.filter(e => e.status === 'done' || e.status === 'error');
   const lines: string[] = [
     '══════════════════════════════════════════',
@@ -188,12 +218,21 @@ const buildExportText = (evs: AgentOutputEvent[], tokenMap: Map<string, TokenUsa
   ];
   done.forEach((ev, idx) => {
     const meta = getMeta(ev.agent);
-    const tok = tokenMap.get(ev.id);
+    const toks = tokenMap.get(ev.id) ?? [];
+    const tok = toks[toks.length - 1];
     lines.push(`[${idx + 1}] ${meta.label.toUpperCase()} · ${ev.label}`);
     lines.push('─'.repeat(44));
     if (ev.summary) lines.push(`OUTPUT: ${ev.summary}`);
     if (tok) {
-      lines.push(`TOKENS: ${fmt(tok.totalTokens)} total (↑${fmt(tok.inputTokens)} entrada · ↓${fmt(tok.outputTokens)} saída) · ${PROVIDER_LABEL[tok.provider]} / ${tok.model}`);
+      const total = toks.reduce((sum, item) => sum + item.totalTokens, 0);
+      lines.push(`TOKENS: ${fmt(total)} total${toks.length > 1 ? ` em ${toks.length} chamadas` : ''} · último: ${PROVIDER_LABEL[tok.provider]} / ${tok.model}`);
+      if (toks.length > 1) {
+        toks.forEach((entry) => {
+          lines.push(`  - ${PROVIDER_LABEL[entry.provider]} / ${entry.model} · ↑${fmt(entry.inputTokens)} entrada · ↓${fmt(entry.outputTokens)} saída · ${fmt(entry.totalTokens)} total`);
+        });
+      } else {
+        lines.push(`  - ↑${fmt(tok.inputTokens)} entrada · ↓${fmt(tok.outputTokens)} saída`);
+      }
     }
     if (ev.detail) {
       lines.push('');
@@ -254,19 +293,28 @@ const AgentThinkingPanel: React.FC = () => {
 
   // Map agentEvent.id → token event by matching sequential occurrence per label
   const tokenMap = React.useMemo(() => {
-    const byLabel = new Map<string, TokenUsageEvent[]>();
-    for (const t of tokenEvents) {
-      const list = byLabel.get(t.label);
-      if (list) list.push(t); else byLabel.set(t.label, [t]);
-    }
-    const labelCount = new Map<string, number>();
-    const result = new Map<string, TokenUsageEvent>();
+    const result = new Map<string, TokenUsageEvent[]>();
+    const completedByLabel = new Map<string, AgentOutputEvent[]>();
+
     for (const ev of events) {
-      const n = labelCount.get(ev.label) ?? 0;
-      labelCount.set(ev.label, n + 1);
-      const list = byLabel.get(ev.label);
-      if (list?.[n]) result.set(ev.id, list[n]);
+      const list = completedByLabel.get(ev.label);
+      if (list) list.push(ev);
+      else completedByLabel.set(ev.label, [ev]);
     }
+
+    for (const [label, labelEvents] of completedByLabel.entries()) {
+      const matchingTokens = tokenEvents
+        .filter(token => token.label === label)
+        .sort((a, b) => a.timestamp - b.timestamp);
+      const orderedEvents = [...labelEvents].sort((a, b) => a.timestamp - b.timestamp);
+
+      orderedEvents.forEach((ev, index) => {
+        const previousEventTime = index > 0 ? orderedEvents[index - 1].timestamp : -Infinity;
+        const tokensForEvent = matchingTokens.filter(token => token.timestamp > previousEventTime && token.timestamp <= ev.timestamp);
+        if (tokensForEvent.length > 0) result.set(ev.id, tokensForEvent);
+      });
+    }
+
     return result;
   }, [tokenEvents, events]);
 
@@ -334,10 +382,10 @@ const AgentThinkingPanel: React.FC = () => {
         animate={{ opacity: 1, x: 0 }}
         exit={{ opacity: 0, x: 40 }}
         transition={{ type: 'spring', stiffness: 300, damping: 25 }}
-        className="fixed bottom-4 right-4 z-50 w-[400px] max-h-[85vh] flex flex-col"
+        className="fixed bottom-4 right-4 z-50 flex w-[340px] max-h-[85vh] flex-col xl:w-[360px]"
       >
         {/* Header */}
-        <div className="bg-stone-900 rounded-t-xl px-4 py-2.5 flex items-center justify-between">
+        <div className="flex items-center justify-between rounded-t-2xl border border-b-0 border-[#2b241d] bg-[linear-gradient(180deg,#221d19,#171310)] px-4 py-3">
           <div className="flex items-center gap-2">
             <div className="relative">
               <Compass className="w-4 h-4 text-amber-400" />
@@ -396,12 +444,12 @@ const AgentThinkingPanel: React.FC = () => {
               animate={{ height: 'auto', opacity: 1 }}
               exit={{ height: 0, opacity: 0 }}
               transition={{ duration: 0.25 }}
-              className="overflow-hidden bg-white/95 backdrop-blur-md border border-t-0 border-stone-200 shadow-2xl"
+              className="overflow-hidden border border-t-0 border-[#dcc9a8] bg-[linear-gradient(180deg,rgba(255,251,243,0.9),rgba(248,239,223,0.84))] shadow-[0_24px_80px_rgba(14,10,4,0.28)] backdrop-blur-xl"
             >
               <div ref={scrollRef} className="p-3 space-y-0 max-h-[62vh] overflow-y-auto">
                 {events.map((ev, idx) => (
                   <React.Fragment key={ev.id}>
-                    <AgentCard event={ev} tokenEvent={tokenMap.get(ev.id)} />
+                    <AgentCard event={ev} tokenEvents={tokenMap.get(ev.id)} />
                     {idx < events.length - 1 && <Connector />}
                   </React.Fragment>
                 ))}
@@ -417,12 +465,12 @@ const AgentThinkingPanel: React.FC = () => {
 
         {/* Rounded bottom only when footer present */}
         {!minimized && (
-          <div className="bg-stone-950 rounded-b-xl h-1" />
+          <div className="h-1 rounded-b-2xl bg-stone-950" />
         )}
 
         {/* Rounded bottom when minimized */}
         {minimized && (
-          <div className="bg-stone-900 rounded-b-xl px-4 py-1.5 border border-t-0 border-stone-800">
+          <div className="rounded-b-2xl border border-t-0 border-stone-800 bg-stone-900 px-4 py-1.5">
             <TokenFooter tokenEvents={tokenEvents} />
           </div>
         )}

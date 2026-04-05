@@ -2,13 +2,14 @@
 import React, { useState } from 'react';
 import { hasAllApiKeys, loadApiKeys } from '../utils/apiKeys';
 import { motion, AnimatePresence } from 'framer-motion';
-import type { Universe, View, GenerationStep, StoryProfile, StoryFormat, StoryTheme, LiteraryArchetype, NarrativePOV } from '../types';
+import type { Universe, View, GenerationStep, StoryProfile, StoryFormat, StoryTheme, LiteraryArchetype, NarrativePOV, LongformBlueprint } from '../types';
 import Button from './ui/Button';
 import Card from './ui/Card';
 import Tooltip from './ui/Tooltip';
 import InlineHelp from './ui/InlineHelp';
 import CharacterPortrait from './ui/CharacterPortrait';
-import { BookOpen, Users, FileText, Sparkles, Clock, Zap, Hammer, Loader2, Download, Upload, Check, ArrowRight, Shuffle, Square, Globe } from 'lucide-react';
+import GenerationRitualOverlay from './ui/GenerationRitualOverlay';
+import { BookOpen, Users, FileText, Sparkles, Clock, Zap, Hammer, Loader2, Download, Upload, Check, ArrowRight, Shuffle, Globe } from 'lucide-react';
 import type { AutogenProgress } from '../services/geminiService';
 import { useLanguage } from '../LanguageContext';
 
@@ -139,7 +140,8 @@ const ForgeProfilePanel: React.FC<{
   onGenerate: () => void;
   isLoading: boolean;
   footerContent?: React.ReactNode;
-}> = ({ profile, onChange, onGenerate, isLoading, footerContent }) => {
+  ctaLabel?: string;
+}> = ({ profile, onChange, onGenerate, isLoading, footerContent, ctaLabel }) => {
   const { t, lang } = useLanguage();
 
   // Build translated option lists
@@ -390,7 +392,7 @@ const ForgeProfilePanel: React.FC<{
           </div>
           <Button onClick={onGenerate} isLoading={isLoading} className="bg-stone-900 text-white hover:bg-black self-start md:self-auto">
             <Sparkles className="w-4 h-4 mr-2" />
-            {t('forge.cta')}
+            {ctaLabel ?? t('forge.cta')}
           </Button>
         </div>
       </div>
@@ -402,7 +404,9 @@ interface DashboardProps {
   universe: Universe | null;
   onBuildUniverseManual?: (name: string, description: string) => void;
   onDivineGenesis?: (profile: StoryProfile) => void;
-  onAutoGen?: (profile: StoryProfile, chaptersCount: number) => void;
+  onAutoGen?: (profile: StoryProfile) => void;
+  onConfirmAutoGen?: () => void;
+  onCancelAutoGen?: () => void;
   onAbortAutoGen?: () => void;
   onGenerateCharacter?: () => void;
   onGenerateChapter?: () => void;
@@ -412,9 +416,8 @@ interface DashboardProps {
   isLoading: boolean;
   genesisStep?: GenerationStep;
   autoGenProgress?: AutogenProgress | null;
+  pendingLongformRun?: { universe: Universe; blueprint: LongformBlueprint } | null;
 }
-
-const AUTOGEN_CHAPTER_OPTIONS = [2, 3];
 
 const AutogenProgressOverlay: React.FC<{ progress: AutogenProgress; onAbort: () => void }> = ({ progress, onAbort }) => {
     const { lang } = useLanguage();
@@ -440,7 +443,7 @@ const AutogenProgressOverlay: React.FC<{ progress: AutogenProgress; onAbort: () 
                         ? (lang === 'pt' ? 'Geração concluída!' : 'Generation complete!')
                         : aborted
                         ? (lang === 'pt' ? 'Motor interrompido' : 'Engine stopped')
-                        : (lang === 'pt' ? 'Motor Autônomo rodando...' : 'Autonomous Engine running...')}
+                        : (lang === 'pt' ? 'Obra completa em geração...' : 'Complete work in progress...')}
                 </h2>
 
                 <div className="space-y-3">
@@ -476,6 +479,135 @@ const AutogenProgressOverlay: React.FC<{ progress: AutogenProgress; onAbort: () 
             </div>
         </div>
     );
+};
+
+const LongformBlueprintPreview: React.FC<{
+  blueprint: LongformBlueprint;
+  onConfirm: () => void;
+  onCancel: () => void;
+  isLoading: boolean;
+}> = ({ blueprint, onConfirm, onCancel, isLoading }) => {
+  const { lang } = useLanguage();
+  const formatFunctionLabel = (value: string) =>
+    value
+      .replace(/_/g, ' ')
+      .replace(/\b\w/g, letter => letter.toUpperCase());
+
+  return (
+    <div className="fixed inset-0 z-50 bg-paper/90 backdrop-blur-sm flex items-center justify-center p-4">
+      <div className="flex max-h-[92vh] w-full max-w-6xl flex-col overflow-hidden rounded-3xl border border-stone-200 bg-white shadow-2xl">
+        <div className="flex items-start justify-between gap-4 border-b border-stone-100 px-5 py-4 sm:px-6">
+          <div>
+            <p className="mb-1 text-[11px] font-mono uppercase tracking-[0.24em] text-nobel">
+              {lang === 'pt' ? 'Mapa da obra' : 'Work blueprint'}
+            </p>
+            <h2 className="text-xl font-serif text-stone-dark sm:text-2xl">{blueprint.title}</h2>
+            <p className="mt-1 max-w-3xl text-sm leading-6 text-stone-500">{blueprint.logline}</p>
+          </div>
+          <div className="shrink-0 rounded-2xl border border-stone-200 bg-stone-50 px-3 py-2 text-[11px] uppercase tracking-[0.22em] text-stone-400">
+            <span>{blueprint.minChapters}-{blueprint.maxChapters}</span>
+            <span className="ml-2">{lang === 'pt' ? 'capítulos' : 'chapters'}</span>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto">
+          <div className="grid gap-0 xl:grid-cols-[1.1fr_0.9fr]">
+            <div className="space-y-5 border-b border-stone-100 p-5 sm:p-6 xl:border-b-0 xl:border-r">
+              <div className="grid gap-3 lg:grid-cols-3">
+                <Card className="border-stone-200 p-3.5">
+                  <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.18em] text-stone-400">
+                    {lang === 'pt' ? 'Promessa' : 'Promise'}
+                  </p>
+                  <p className="text-[13px] leading-5 text-stone-700">{blueprint.promise}</p>
+                </Card>
+                <Card className="border-stone-200 p-3.5">
+                  <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.18em] text-stone-400">
+                    {lang === 'pt' ? 'Conflito central' : 'Core conflict'}
+                  </p>
+                  <p className="text-[13px] leading-5 text-stone-700">{blueprint.conflictCore}</p>
+                </Card>
+                <Card className="border-stone-200 p-3.5">
+                  <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.18em] text-stone-400">
+                    {lang === 'pt' ? 'Foco do protagonista' : 'Protagonist focus'}
+                  </p>
+                  <p className="text-[13px] leading-5 text-stone-700">{blueprint.protagonistFocus}</p>
+                </Card>
+              </div>
+
+              <div>
+                <div className="mb-3 flex items-center justify-between">
+                  <h3 className="text-sm font-bold uppercase tracking-[0.2em] text-stone-500">
+                    {lang === 'pt' ? 'Atos e marcos' : 'Acts and milestones'}
+                  </h3>
+                  <span className="text-xs text-stone-400">
+                    {blueprint.targetChapters} {lang === 'pt' ? 'capítulos planejados' : 'planned chapters'}
+                  </span>
+                </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  {blueprint.acts.map(act => (
+                    <div key={act.actIndex} className="rounded-2xl border border-stone-200 bg-stone-50/80 p-3.5">
+                      <div className="mb-2 flex items-center justify-between gap-3">
+                        <p className="text-sm font-semibold text-stone-800">{act.label}</p>
+                        <span className="text-[10px] uppercase tracking-[0.18em] text-stone-400">
+                          {act.chapterStart}-{act.chapterEnd}
+                        </span>
+                      </div>
+                      <p className="mb-3 text-[13px] leading-5 text-stone-600">{act.purpose}</p>
+                      <div className="rounded-xl border border-stone-200 bg-white px-3 py-2">
+                        <p className="mb-1 text-[10px] uppercase tracking-[0.18em] text-stone-400">
+                          {lang === 'pt' ? 'Marco do ato' : 'Act milestone'}
+                        </p>
+                        <p className="text-[13px] leading-5 text-stone-700">{act.milestone}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-4 bg-stone-50/70 p-5 sm:p-6">
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="text-sm font-bold uppercase tracking-[0.2em] text-stone-500">
+                  {lang === 'pt' ? 'Trajetória dos capítulos' : 'Chapter trajectory'}
+                </h3>
+                <span className="text-xs text-stone-400">
+                  {blueprint.chapterMap.length} {lang === 'pt' ? 'etapas' : 'steps'}
+                </span>
+              </div>
+              <div className="grid max-h-[46vh] gap-2 overflow-y-auto pr-1 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+                {blueprint.chapterMap.map(entry => (
+                  <div key={entry.chapterNumber} className="rounded-2xl border border-stone-200 bg-white px-3.5 py-3">
+                    <div className="mb-1.5 flex items-center justify-between gap-3">
+                      <span className="text-sm font-semibold text-stone-800">
+                        {lang === 'pt' ? `Cap. ${entry.chapterNumber}` : `Ch. ${entry.chapterNumber}`}
+                      </span>
+                      <span className="text-[10px] uppercase tracking-[0.16em] text-stone-400">
+                        {formatFunctionLabel(entry.function)}
+                      </span>
+                    </div>
+                    <p className="text-[13px] leading-5 text-stone-600">{entry.goal}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-col-reverse gap-3 border-t border-stone-100 bg-white px-5 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+          <button
+            onClick={onCancel}
+            className="text-sm text-stone-500 hover:text-stone-800 transition-colors"
+          >
+            {lang === 'pt' ? 'Voltar e refazer direção' : 'Back and revise direction'}
+          </button>
+          <Button onClick={onConfirm} isLoading={isLoading} className="bg-stone-900 text-white hover:bg-black">
+            <Sparkles className="w-4 h-4 mr-2" />
+            {lang === 'pt' ? 'Começar esta obra' : 'Start this work'}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
 };
 
 const StatCard: React.FC<{ icon: React.ReactNode; label: string; value: string | number }> = ({ icon, label, value }) => (
@@ -536,6 +668,8 @@ export default function Dashboard({
     onBuildUniverseManual,
     onDivineGenesis,
     onAutoGen,
+    onConfirmAutoGen,
+    onCancelAutoGen,
     onAbortAutoGen,
     onGenerateCharacter,
     onGenerateChapter,
@@ -545,24 +679,33 @@ export default function Dashboard({
     isLoading,
     genesisStep = 'idle',
     autoGenProgress,
+    pendingLongformRun,
 }: DashboardProps) {
   const { t, lang } = useLanguage();
   const [activePath, setActivePath] = useState<null | 'architect' | 'genesis' | 'autogen'>(null);
   const [universeName, setUniverseName] = useState('');
   const [universeDesc, setUniverseDesc] = useState('');
   const [profile, setProfile] = useState<StoryProfile>(() => ({ ...DEFAULT_PROFILE, lang: lang as 'pt' | 'en' }));
-  const [autoGenChapters, setAutoGenChapters] = useState(3);
   const apiKeysFilled = hasAllApiKeys(loadApiKeys());
 
   // SHOW AUTOGEN PROGRESS OVERLAY
   if (autoGenProgress && autoGenProgress.phase !== 'done') {
-      return <AutogenProgressOverlay progress={autoGenProgress} onAbort={() => onAbortAutoGen?.()} />;
+      return <GenerationRitualOverlay progress={autoGenProgress} onAbort={() => onAbortAutoGen?.()} />;
   }
 
   // SHOW PROGRESS OVERLAY IF GENESIS IS RUNNING
   if (genesisStep !== 'idle' && genesisStep !== 'done') {
-      return <GenesisProgress step={genesisStep} />;
+    return <GenesisProgress step={genesisStep} />;
   }
+
+  const blueprintPreview = pendingLongformRun ? (
+    <LongformBlueprintPreview
+      blueprint={pendingLongformRun.blueprint}
+      onConfirm={() => onConfirmAutoGen?.()}
+      onCancel={() => onCancelAutoGen?.()}
+      isLoading={isLoading}
+    />
+  ) : null;
 
   // ── State 1: Welcome — Choose Your Path ─────────────────────────────────────
   if (!universe) {
@@ -610,11 +753,11 @@ export default function Dashboard({
             {
               id: 'autogen' as const,
               icon: <Zap className="w-8 h-8" />,
-              title: lang === 'pt' ? 'Motor Autônomo' : 'Autonomous Engine',
-              tagline: lang === 'pt' ? 'Genesis + N Capítulos' : 'Genesis + N Chapters',
+              title: lang === 'pt' ? 'Obra Completa' : 'Complete Work',
+              tagline: lang === 'pt' ? 'Blueprint + 15-20 capítulos' : 'Blueprint + 15-20 chapters',
               desc: lang === 'pt'
-                  ? 'Cria o universo e escreve múltiplos capítulos em sequência, sem intervenção.'
-                  : 'Creates the universe and writes multiple chapters in sequence, unattended.',
+                  ? 'Transforma sua premissa em uma obra longa com blueprint, atos e progressão estrutural antes da escrita começar.'
+                  : 'Turns your premise into a longform work with blueprint, acts, and structural progression before writing begins.',
               accentClass: 'border-stone-400 from-stone-50',
               iconClass: 'text-stone-600',
               activeClass: 'border-stone-700 shadow-md',
@@ -768,28 +911,19 @@ export default function Dashboard({
                 <ForgeProfilePanel
                   profile={profile}
                   onChange={setProfile}
-                  onGenerate={() => onAutoGen?.(profile, autoGenChapters)}
+                  onGenerate={() => onAutoGen?.(profile)}
                   isLoading={isLoading}
+                  ctaLabel={lang === 'pt' ? 'Gerar blueprint da obra' : 'Generate work blueprint'}
                   footerContent={
-                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
-                      <span className="text-xs font-bold uppercase tracking-widest text-stone-500">
-                        {lang === 'pt' ? 'Capítulos totais:' : 'Total chapters:'}
-                      </span>
-                      <div className="flex items-center gap-2">
-                        {AUTOGEN_CHAPTER_OPTIONS.map(n => (
-                          <button
-                            key={n}
-                            onClick={() => setAutoGenChapters(n)}
-                            className={`min-w-[42px] h-10 px-3 rounded-xl border text-sm font-bold transition-all ${
-                              autoGenChapters === n
-                                ? 'border-nobel bg-amber-50 text-stone-900 shadow-sm'
-                                : 'border-stone-300 text-stone-500 hover:border-stone-500'
-                            }`}
-                          >
-                            {n}
-                          </button>
-                        ))}
-                      </div>
+                    <div className="rounded-2xl border border-stone-200 bg-white px-4 py-3">
+                      <p className="text-[11px] font-bold uppercase tracking-[0.22em] text-stone-400 mb-1">
+                        {lang === 'pt' ? 'Fluxo longform' : 'Longform flow'}
+                      </p>
+                      <p className="text-sm text-stone-600 leading-relaxed">
+                        {lang === 'pt'
+                          ? 'Você escolhe a alma da obra. Primeiro o engine monta o blueprint completo; quando você clicar em “Começar esta obra”, ele entra no modo de escrita e gera os capítulos.'
+                          : 'You choose the soul of the work. The engine designs the full arc, splits the journey into acts, and only starts writing after your approval.'}
+                      </p>
                     </div>
                   }
                 />
@@ -797,6 +931,8 @@ export default function Dashboard({
             )}
           </AnimatePresence>
         </div>
+
+        {blueprintPreview}
       </div>
     );
   }
@@ -821,6 +957,7 @@ export default function Dashboard({
     const recentCharacters = [...characters].reverse().slice(0, 5);
 
     return (
+        <>
         <div className="space-y-6 max-w-7xl mx-auto pb-12">
             {/* 1. Epic Hero Banner with Animated Mini-Astrolabe */}
             <div className="relative w-full h-80 md:h-96 rounded-2xl overflow-hidden shadow-2xl group border border-stone-800">
@@ -995,6 +1132,8 @@ export default function Dashboard({
 
             </div>
         </div>
+        {blueprintPreview}
+        </>
     );
   }
 

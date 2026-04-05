@@ -7,6 +7,7 @@ import type {
     NarrativeMemory, CharacterState, OpenLoop, OpeningStyle, ArbiterIssue,
     TokenUsageEvent, AgentOutputEvent, AgentOutputStatus, WeaverPlan, GenerationQualityMode,
     DirectorGuidance, AIVisibility, DirtyScope, SyncMeta, TrackingConfig, TruthBundle, CharacterLieState, TimelineEventState, TimelineDiscoveryKind, RuleEntryKind, TimelineImpact, TimelineScope,
+    LongformBlueprint, LongformProgressState, LongformChapterFunction,
 } from '../types';
 import { DEFAULT_AGENTS } from '../constants';
 import { createPortraitUrl } from '../utils/portraits';
@@ -49,6 +50,9 @@ const emitAgentOutput = (event: Omit<AgentOutputEvent, 'id' | 'timestamp'>) => {
     if (_agentListeners.length === 0) return;
     const full: AgentOutputEvent = {
         ...event,
+        label: typeof event.label === 'string' ? repairTextArtifacts(event.label) : event.label,
+        summary: typeof event.summary === 'string' ? repairTextArtifacts(event.summary) : event.summary,
+        detail: typeof event.detail === 'string' ? repairTextArtifacts(event.detail) : event.detail,
         id: Math.random().toString(36).substr(2, 9),
         timestamp: Date.now(),
     };
@@ -67,14 +71,84 @@ const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-2.0-f
 // ─── Cerebras — OpenAI-compatible endpoint (free tier) ─────────────────────
 const CEREBRAS_BASE_URL = 'https://api.cerebras.ai/v1';
 const CEREBRAS_DEFAULT_MODEL = process.env.CEREBRAS_MODEL || 'qwen-3-235b-a22b-instruct-2507';
-const BARD_CEREBRAS_MODEL = process.env.BARD_CEREBRAS_MODEL || 'qwen-3-235b-a22b-instruct-2507';
+const CEREBRAS_WEAVER_MODEL = process.env.CEREBRAS_WEAVER_MODEL || 'zai-glm-4.7';
 const CEREBRAS_LAST_RESORT = 'llama3.1-8b'; // absolute last fallback (free tier 8B)
 const CEREBRAS_GPT_OSS_MODELS = new Set(['gpt-oss-120b', 'gpt-oss-20b']);
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
-const OPENROUTER_DEFAULT_MODEL = process.env.OPENROUTER_MODEL || 'qwen/qwen3.6-plus:free';
+const OPENROUTER_DEFAULT_MODEL = 'qwen/qwen3.6-plus:free';
+const OPENROUTER_STRUCTURE_MODEL = process.env.OPENROUTER_STRUCTURE_MODEL || 'openai/gpt-oss-120b:free';
+const AUTOGEN_INTER_CHAPTER_DELAY_MS = Number(process.env.AUTOGEN_INTER_CHAPTER_DELAY_MS || 0);
+const WEAVER_PLAN_STAGGER_MS = Number(process.env.WEAVER_PLAN_STAGGER_MS || 0);
+const LLM_REQUEST_TIMEOUT_MS = Number(process.env.LLM_REQUEST_TIMEOUT_MS || 45000);
+const OPENROUTER_ATTEMPT_TIMEOUT_MS = Number(process.env.OPENROUTER_ATTEMPT_TIMEOUT_MS || 14000);
+
+type OpenRouterRouteConfig = {
+    primary: string;
+    fallbacks: string[];
+};
+
+const getOpenRouterRouteConfig = (label: string, withJsonMode: boolean): OpenRouterRouteConfig => {
+    const normalized = label.toLowerCase();
+
+    if (normalized.includes('bard')) {
+        return {
+            primary: OPENROUTER_DEFAULT_MODEL,
+            fallbacks: [OPENROUTER_STRUCTURE_MODEL],
+        };
+    }
+
+    if (normalized.includes('director') || normalized.includes('weaver') || normalized.includes('lector') || normalized.includes('chronicler')) {
+        return {
+            primary: OPENROUTER_STRUCTURE_MODEL,
+            fallbacks: [OPENROUTER_DEFAULT_MODEL],
+        };
+    }
+
+    if (normalized.includes('blueprint')) {
+        return {
+            primary: OPENROUTER_STRUCTURE_MODEL,
+            fallbacks: [OPENROUTER_DEFAULT_MODEL],
+        };
+    }
+
+    if (normalized.includes('architect') || normalized.includes('soulforger')) {
+        return {
+            primary: OPENROUTER_DEFAULT_MODEL,
+            fallbacks: [OPENROUTER_STRUCTURE_MODEL],
+        };
+    }
+
+    return {
+        primary: withJsonMode ? OPENROUTER_STRUCTURE_MODEL : OPENROUTER_DEFAULT_MODEL,
+        fallbacks: withJsonMode ? [OPENROUTER_DEFAULT_MODEL] : [OPENROUTER_STRUCTURE_MODEL],
+    };
+};
+
+const getPreferredHighCapabilityProvider = (): 'openrouter' | 'cerebras' | 'auto' => {
+    const keys = loadApiKeys();
+    const preferred = keys?.preferredProvider ?? 'auto';
+
+    if (preferred === 'openrouter' && keys?.openrouter?.trim()) return 'openrouter';
+    if (preferred === 'cerebras' && keys?.cerebras?.trim()) return 'cerebras';
+    return 'auto';
+};
 
 const generateId = () => Math.random().toString(36).substr(2, 9);
 const isEconomyMode = (mode?: GenerationQualityMode): boolean => mode === 'economy';
+const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
+const withLlmTimeout = async <T>(label: string, work: Promise<T>, timeoutMs = LLM_REQUEST_TIMEOUT_MS): Promise<T> => {
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    try {
+        return await Promise.race([
+            work,
+            new Promise<T>((_, reject) => {
+                timeoutHandle = setTimeout(() => reject(new Error(`[MythosEngine] ${label} timed out after ${timeoutMs}ms.`)), timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+};
 
 const DEFAULT_AI_VISIBILITY: AIVisibility = 'tracked';
 const DEFAULT_TRACKING: TrackingConfig = {
@@ -283,6 +357,7 @@ const ensureUniverseDefaults = (universe: Universe): Universe => ({
     ...universe,
     subtitle: universe.subtitle ?? '',
     notesPrivate: universe.notesPrivate ?? '',
+    creationMode: universe.creationMode ?? 'manual',
     codex: {
         ...universe.codex,
         overview: universe.codex.overview ?? '',
@@ -299,8 +374,13 @@ const ensureUniverseDefaults = (universe: Universe): Universe => ({
     narrativeMemory: universe.narrativeMemory ? {
         ...universe.narrativeMemory,
         lexicalCooldownGuidance: universe.narrativeMemory.lexicalCooldownGuidance ?? {},
+        stylePatternCooldown: universe.narrativeMemory.stylePatternCooldown ?? {},
         lieStates: universe.narrativeMemory.lieStates ?? [],
     } : universe.narrativeMemory,
+    longformProgress: universe.longformProgress ? {
+        ...universe.longformProgress,
+        completedMilestones: universe.longformProgress.completedMilestones ?? [],
+    } : universe.longformProgress,
     syncMeta: ensureSyncMeta(universe.syncMeta),
 });
 
@@ -313,11 +393,11 @@ const truncateText = (value: string | undefined, maxChars: number): string => {
 const COMPACT_AGENT_PROMPTS: Partial<Record<string, string>> = {
     architect: 'Create a coherent fictional universe with strong atmosphere, opposing factions, and clear limits. Return only what was requested.',
     soulforger: 'Create psychologically coherent characters with a Ghost and a Lie. Keep the protagonist active and concrete.',
-    director: 'Analyse narrative health: open loops, faction balance, protagonist agency. Issue per-chapter guidance JSON only.',
+    director: 'Analyse narrative health and prose drift: open loops, faction balance, protagonist agency, repeated openings/endings, and repeated rhetorical patterns. Issue per-chapter guidance JSON only.',
     weaver: 'Plan 5-7 causal beats. Each beat must include actor, action, obstacle, and consequence. Avoid textbook plot labels and generic screenplay scaffolding. Output structured JSON only.',
-    bard: 'Write continuous narrative prose only. No headers or meta text. Start concrete, maintain POV, dramatize actions, avoid repetition or cliches, vary sentence temperature, forbid filtering ("he felt/he knew/he saw"), avoid "parecia/como se" except when indispensable, and default to affirmative syntax instead of contrastive negation.',
+    bard: 'Write continuous narrative prose only. No headers or meta text. Start concrete, maintain POV, dramatize actions, avoid repetition or cliches, vary sentence temperature, forbid filtering ("he felt/he knew/he saw"), avoid "parecia/como se" except when indispensable, default to affirmative syntax instead of contrastive negation, and vary openings/endings from recent chapters.',
     chronicler: 'Extract explicit facts into the requested JSON only. Reuse known character IDs, avoid invention, and only record stable codex facts.',
-    lector: 'Polish the chapter with minimal edits. Prefer concrete nouns, physical verbs, direct syntax, and lower-temperature phrasing. Remove repetition, filtering, hedged similes, and banned rhetoric without making the prose more dramatic.',
+    lector: 'Polish the chapter with minimal edits. Prefer concrete nouns, physical verbs, direct syntax, and lower-temperature phrasing. Remove repetition, filtering, hedged similes, banned rhetoric, repeated openings/endings, and saturated image families without making the prose more dramatic.',
 };
 
 const BARD_STYLE_OVERRIDE = `
@@ -332,7 +412,74 @@ WEAK GLUE WORDS:
 - Do NOT use "mas", "não", "apenas", "só", "quase" as rhythmic crutches in consecutive sentences.
 - If you need force, cut the sentence or sharpen the verb. Do not simulate intensity with connective negation.
 - Prefer affirmative syntax and concrete sequence over explanatory contrast.
+
+RHETORICAL REPETITION BAN:
+- FORBIDDEN default molds: "não X, mas Y", "não era X. Era Y.", "não vinha de X, vinha de Y", "não por X, por Y", "não com X, mas com Y".
+- If contrast is necessary, express it through scene consequence, juxtaposition, or paragraph order — not sentence self-correction.
+- Do NOT build intensity by repeatedly denying one image and replacing it with another.
+
+OPENING / ENDING VARIETY:
+- Do NOT open consecutive chapters with the same atmospheric recipe.
+- Avoid always opening with smell + texture + bodily discomfort + pulsing architecture.
+- Avoid ending every chapter with an identity riddle or rhetorical question.
+- Vary chapter temperature: some chapters should cut cleaner, move faster, or speak more plainly.
 `;
+
+const STYLE_PATTERN_LABELS: Record<string, string> = {
+    nao_x_mas_y: 'Avoid contrastive-negation formulas like "não X, mas Y".',
+    nao_era_x_era_y: 'Avoid sentence-pair correction formulas like "não era X. Era Y."',
+    opening_sensorial_densa: 'Do not open with dense atmospheric sensation. Start with action, dialogue, intrusion, or concrete event.',
+    ending_pergunta_identitaria: 'Do not close with a rhetorical identity question. End on action, image, choice, or factual revelation.',
+    opening_nome_movimento: 'Do not start the first sentence with protagonist name + movement verb.',
+};
+
+const inferOpeningPattern = (text: string, protagonistName = ''): string | null => {
+    const first = text.split(/\n+/).map(line => line.trim()).find(Boolean)?.toLowerCase() || '';
+    if (!first) return null;
+    const normalizedName = protagonistName.toLowerCase();
+    if (normalizedName && new RegExp(`^${normalizedName}\\s+(caminhou|correu|desceu|subiu|entrou|atravessou|seguiu|avançou|walked|ran|moved|descended|climbed|entered)\\b`).test(first)) {
+        return 'opening_nome_movimento';
+    }
+    const sensoryHits = ['cheiro', 'gosto', 'ar ', 'umidade', 'cobre', 'ferro', 'terra', 'raiz', 'odor', 'puls', 'latej', 'respir']
+        .filter(token => first.includes(token)).length;
+    if (sensoryHits >= 3) return 'opening_sensorial_densa';
+    return null;
+};
+
+const inferEndingPattern = (text: string): string | null => {
+    const lines = text.trim().split(/\n+/).map(line => line.trim()).filter(Boolean);
+    const tail = lines.slice(-2).join(' ').toLowerCase();
+    if (!tail) return null;
+    if (tail.includes('?') && /(quem|o que|será|seria|por que|porque|why|who|what)/.test(tail)) {
+        return 'ending_pergunta_identitaria';
+    }
+    return null;
+};
+
+const getRecentChapterStarts = (universe: Universe, count = 2): string[] =>
+    universe.chapters.slice(-count).map(ch => ch.content.split(/\n+/).map(line => line.trim()).find(Boolean) || '').filter(Boolean);
+
+const getRecentChapterEndings = (universe: Universe, count = 2): string[] =>
+    universe.chapters.slice(-count).map(ch => ch.content.trim().split(/\n+/).map(line => line.trim()).filter(Boolean).slice(-1)[0] || '').filter(Boolean);
+
+const detectImageryOveruse = (text: string): string[] => {
+    const families = [
+        ['osso', 'ossos', 'fêmur', 'femur', 'vértebra', 'vertebra', 'dente', 'dentes', 'crânio', 'cranio'],
+        ['pedra', 'rocha', 'pedra-viva', 'rocha-viva'],
+        ['cobre', 'ferro', 'metal', 'metálico', 'metalico'],
+        ['umidade', 'úmido', 'umido', 'terra molhada', 'raiz', 'raízes', 'raizes'],
+        ['abismo', 'poço', 'poco', 'vazio'],
+        ['pulsava', 'pulse', 'latejava', 'latejar', 'respirava', 'respira'],
+    ];
+    const lower = text.toLowerCase();
+    return families
+        .map(group => ({
+            label: group[0],
+            hits: group.reduce((sum, token) => sum + ((lower.match(new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length), 0),
+        }))
+        .filter(item => item.hits >= 4)
+        .map(item => item.label);
+};
 
 // ─── Story Profile Helpers ──────────────────────────────────────────────────
 
@@ -412,11 +559,559 @@ LITERARY INFLUENCES (style/world-feel/prose register — shape HOW, not WHAT): $
 `;
 };
 
+const LONGFORM_FUNCTION_LABELS: Record<LongformChapterFunction, string> = {
+    setup: 'Setup',
+    inciting_break: 'Inciting Break',
+    lock_in: 'Lock-In',
+    complication: 'Complication',
+    reversal: 'Reversal',
+    midpoint: 'Midpoint',
+    descent: 'Descent',
+    collapse: 'Collapse',
+    pre_climax: 'Pre-Climax',
+    climax: 'Climax',
+    aftermath: 'Aftermath',
+};
+
+const pickBlueprintAnchors = (universe: Universe) => {
+    const factionTitles = universe.codex.factions.map(entry => entry.title).filter(Boolean);
+    const initialSettingRule = universe.codex.rules.find(entry => entry.title === 'Initial Setting');
+    const centralConflictRule = universe.codex.rules.find(entry => entry.title === 'Central Conflict');
+    const namedRuleEntries = universe.codex.rules.filter(entry => entry.title && entry.title !== 'Initial Setting' && entry.title !== 'Central Conflict');
+    const ruleTitles = namedRuleEntries.map(entry => entry.title).filter(Boolean);
+    const timelineTitles = universe.codex.timeline.map(entry => entry.title || entry.content).filter(Boolean);
+    return {
+        factionA: factionTitles[0] || (universe.lang === 'en' ? 'the ruling faction' : 'a facção dominante'),
+        factionB: factionTitles[1] || factionTitles[0] || (universe.lang === 'en' ? 'the opposing faction' : 'a facção rival'),
+        ruleA: ruleTitles[0] || initialSettingRule?.content || (universe.lang === 'en' ? 'the central rule of the world' : 'a regra central do mundo'),
+        ruleB: ruleTitles[1] || centralConflictRule?.content || ruleTitles[0] || (universe.lang === 'en' ? 'the forbidden law' : 'a lei proibida'),
+        timelineA: timelineTitles[0] || centralConflictRule?.content || (universe.lang === 'en' ? 'the buried event that shaped the present' : 'o evento enterrado que moldou o presente'),
+    };
+};
+
+const normalizeBlueprintText = (text: string, universe: Universe): string => {
+    const initialSetting = universe.codex.rules.find(rule => rule.title === 'Initial Setting')?.content?.trim() || universe.codex.overview?.trim() || universe.name;
+    const centralConflict = universe.codex.rules.find(rule => rule.title === 'Central Conflict')?.content?.trim() || universe.description?.trim() || universe.codex.overview?.trim() || universe.name;
+    const timelineAnchor = universe.codex.timeline[0]?.title?.trim() || universe.codex.timeline[0]?.content?.trim() || centralConflict;
+
+    return repairTextArtifacts(text)
+        .replace(/\bInitial Setting\b/g, initialSetting)
+        .replace(/\bCentral Conflict\b/g, centralConflict)
+        .replace(/\bthe buried event that shaped the present\b/gi, timelineAnchor)
+        .replace(/\bo evento enterrado que moldou o presente\b/gi, timelineAnchor);
+};
+
+const normalizeLongformBlueprint = (blueprint: LongformBlueprint, universe: Universe): LongformBlueprint => ({
+    ...deepRepairTextArtifacts(blueprint),
+    title: normalizeBlueprintText(blueprint.title, universe),
+    logline: normalizeBlueprintText(blueprint.logline, universe),
+    promise: normalizeBlueprintText(blueprint.promise, universe),
+    conflictCore: normalizeBlueprintText(blueprint.conflictCore, universe),
+    protagonistFocus: normalizeBlueprintText(blueprint.protagonistFocus, universe),
+    acts: blueprint.acts.map(act => ({
+        ...act,
+        label: normalizeBlueprintText(act.label, universe),
+        purpose: normalizeBlueprintText(act.purpose, universe),
+        milestone: normalizeBlueprintText(act.milestone, universe),
+    })),
+    milestones: blueprint.milestones.map(item => ({
+        ...item,
+        label: normalizeBlueprintText(item.label, universe),
+        objective: normalizeBlueprintText(item.objective, universe),
+    })),
+    chapterMap: blueprint.chapterMap.map(entry => ({
+        ...entry,
+        goal: normalizeBlueprintText(entry.goal, universe),
+        milestone: entry.milestone ? normalizeBlueprintText(entry.milestone, universe) : entry.milestone,
+    })),
+});
+
+const BLUEPRINT_GENERIC_PATTERNS = [
+    /training, initiation, infiltration,? or adaptation/i,
+    /treinamento, inicia[cç][aã]o, infiltra[cç][aã]o ou adapta[cç][aã]o/i,
+    /price of victory/i,
+    /preço da vitória/i,
+    /hidden truth/i,
+    /verdade oculta/i,
+    /apparent victory/i,
+    /vit[óo]ria aparente/i,
+    /false shelter/i,
+    /abrigo falso/i,
+    /narrower path/i,
+    /caminho estreito/i,
+    /surviving forces/i,
+    /forças sobreviventes/i,
+    /central promise/i,
+    /promessa central/i,
+    /central engine of the conflict/i,
+    /motor central do conflito/i,
+    /what must be won, lost, or exposed/i,
+    /o que precisa ser ganho, perdido ou exposto/i,
+    [/revelaçãoo/gi, 'revelação'], [/exposiçãoo/gi, 'exposição'], [/deterioraçãoo/gi, 'deterioração'],
+    [/puniçãoo/gi, 'punição'], [/facçõeses/gi, 'facções'], [/prote\?\?o/gi, 'proteção'],
+    [/institui\?\?/gi, 'instituições'], [/rel\?quia/gi, 'relíquia'], [/espec\?fica/gi, 'específica'],
+    [/viol\?ncia/gi, 'violência'], [/imposs\?vel/gi, 'impossível'], [/sacrif\?cio/gi, 'sacrifício'],
+    [/cl\?max/gi, 'clímax'],
+    [/Ã¢Å¡Â /g, 'WARN '], [/invÃ¡lido/gi, 'invalido'],
+];
+
+const blueprintTextHasNamedAnchor = (text: string, anchors: string[]): boolean =>
+    anchors.some(anchor => anchor.length > 2 && text.toLowerCase().includes(anchor.toLowerCase()));
+
+const estimateLongformTargetChapters = (universe: Universe): number => {
+    const profile = universe.storyProfile;
+    const premiseLength = (profile?.premise || universe.description || '').trim().length;
+    const themes = profile?.themes?.length ?? 0;
+    const archetypes = profile?.archetypes?.length ?? 0;
+    const factionCount = universe.codex.factions.length;
+    const ruleCount = universe.codex.rules.length;
+    const timelineCount = universe.codex.timeline.length;
+    const tone = normalizeThemeKey(profile?.tone ?? '');
+    const proseStyle = profile?.proseStyle ?? '';
+
+    let score = 16;
+    if (premiseLength > 150) score += 1;
+    if (premiseLength > 260) score += 1;
+    if (themes >= 3) score += 1;
+    if (archetypes >= 2) score += 1;
+    if (factionCount >= 3) score += 1;
+    if (ruleCount >= 5) score += 1;
+    if (timelineCount >= 4) score += 1;
+    if (tone.includes('epic') || tone.includes('epico') || tone.includes('mysterious') || tone.includes('misterioso') || tone.includes('lyrical') || tone.includes('lirico')) score += 1;
+    if (proseStyle === 'novel') score += 1;
+    if (proseStyle === 'light_novel') score -= 1;
+
+    return Math.max(15, Math.min(20, score));
+};
+
+const buildDynamicChapterFunctions = (targetChapters: number): LongformChapterFunction[] => {
+    const total = Math.max(15, Math.min(20, targetChapters));
+    const sequence: LongformChapterFunction[] = Array.from({ length: total }, () => 'complication');
+    sequence[0] = 'setup';
+    sequence[1] = 'inciting_break';
+    sequence[2] = 'lock_in';
+
+    const midpointIndex = Math.max(7, Math.min(total - 6, Math.round(total / 2))) - 1;
+    const aftermathIndex = total - 1;
+
+    if (total >= 18) {
+        sequence[total - 5] = 'collapse';
+        sequence[total - 4] = 'pre_climax';
+        sequence[total - 3] = 'pre_climax';
+        sequence[total - 2] = 'climax';
+        sequence[total - 1] = 'aftermath';
+    } else {
+        sequence[total - 4] = 'collapse';
+        sequence[total - 3] = 'pre_climax';
+        sequence[total - 2] = 'climax';
+        sequence[total - 1] = 'aftermath';
+    }
+
+    sequence[midpointIndex] = 'midpoint';
+
+    for (let i = 3; i < midpointIndex; i++) {
+        sequence[i] = i % 2 === 0 ? 'reversal' : 'complication';
+    }
+    for (let i = midpointIndex + 1; i < total - (total >= 18 ? 5 : 4); i++) {
+        sequence[i] = (i - midpointIndex) % 3 === 0 ? 'reversal' : ((i - midpointIndex) % 2 === 0 ? 'descent' : 'complication');
+    }
+
+    sequence[aftermathIndex] = 'aftermath';
+    return sequence;
+};
+
+const buildFallbackLongformBlueprint = (universe: Universe): LongformBlueprint => {
+    const protagonist = universe.characters[0];
+    const protagonistName = protagonist?.name || 'The protagonist';
+    const title = universe.name || 'Untitled Work';
+    const logline = universe.description?.trim() || universe.codex.overview?.trim() || `A longform story centered on ${protagonistName}.`;
+    const lang = universe.lang ?? universe.storyProfile?.lang ?? 'pt';
+    const themes = universe.storyProfile?.themes ?? [];
+    const conflict = universe.codex.rules.find(rule => rule.title === 'Central Conflict')?.content?.trim() || universe.codex.overview?.trim() || logline;
+    const initialSetting = universe.codex.rules.find(rule => rule.title === 'Initial Setting')?.content?.trim() || universe.codex.overview?.trim() || title;
+    const anchors = pickBlueprintAnchors(universe);
+    const targetChapters = estimateLongformTargetChapters(universe);
+    const chapterFunctions = buildDynamicChapterFunctions(targetChapters);
+    const actOneEnd = targetChapters <= 16 ? 4 : 5;
+    const actTwoEnd = Math.max(actOneEnd + 4, Math.round(targetChapters * 0.5));
+    const actThreeEnd = Math.max(actTwoEnd + 4, targetChapters - (targetChapters >= 18 ? 4 : 3));
+    const milestoneChapters = [actOneEnd, actTwoEnd, actThreeEnd, targetChapters];
+    const themeLine = themes.length > 0
+        ? (lang === 'en' ? `The work explores ${themes.join(', ')} under escalating pressure.` : `A obra explora ${themes.join(', ')} sob press?o crescente.`)
+        : (lang === 'en' ? 'The work promises escalating moral and emotional consequence.' : 'A obra promete consequ?ncia moral e emocional crescente.');
+    const promise = lang === 'en'
+        ? `${universe.codex.overview?.trim() || logline} The pressure concentrates around ${initialSetting}, the fracture between ${anchors.factionA} and ${anchors.factionB}, and the dangerous truth hidden inside ${anchors.ruleA}. ${themeLine}`.trim()
+        : `${universe.codex.overview?.trim() || logline} A press?o se concentra em ${initialSetting}, na fratura entre ${anchors.factionA} e ${anchors.factionB}, e na verdade perigosa escondida em ${anchors.ruleA}. ${themeLine}`.trim();
+    const actMilestones = lang === 'en'
+        ? [
+            `${protagonistName} is forced to choose between the safety of ${initialSetting} and the pull of ${anchors.ruleA}, making open conflict with ${anchors.factionA} unavoidable.`,
+            `A revelation tied to ${anchors.timelineA} exposes what ${anchors.factionB} really wants and changes the scale of the conflict.`,
+            `${protagonistName} loses protection, is exposed through ${anchors.ruleB}, and is cornered into acting without cover.`,
+            `The final collision resolves the fracture between ${anchors.factionA} and ${anchors.factionB} through sacrifice, consequence, and a changed order.`,
+        ]
+        : [
+            `${protagonistName} ? for?ado a escolher entre a seguran?a de ${initialSetting} e o chamado de ${anchors.ruleA}, tornando inevit?vel o conflito aberto com ${anchors.factionA}.`,
+            `Uma revela??o ligada a ${anchors.timelineA} exp?e o que ${anchors.factionB} realmente quer e muda a escala do conflito.`,
+            `${protagonistName} perde prote??o, ? exposto por ${anchors.ruleB} e fica encurralado a agir sem cobertura.`,
+            `A colis?o final resolve a fratura entre ${anchors.factionA} e ${anchors.factionB} por meio de sacrif?cio, consequ?ncia e nova ordem.`,
+        ];
+    const acts = [
+        { actIndex: 1, label: lang === 'en' ? 'Act I' : 'Ato I', purpose: lang === 'en' ? 'Establish the ordinary order, the pressure lines, and the first irreversible breach.' : 'Estabele?a a ordem comum, as linhas de press?o e a primeira ruptura irrevers?vel.', chapterStart: 1, chapterEnd: actOneEnd, milestone: actMilestones[0] },
+        { actIndex: 2, label: lang === 'en' ? 'Act II-A' : 'Ato II-A', purpose: lang === 'en' ? 'Expand the arena, sharpen factional pressure, and deepen attachment under danger.' : 'Expanda a arena, afie a press?o entre fac??es e aprofunde v?nculos sob perigo.', chapterStart: actOneEnd + 1, chapterEnd: actTwoEnd, milestone: actMilestones[1] },
+        { actIndex: 3, label: lang === 'en' ? 'Act II-B' : 'Ato II-B', purpose: lang === 'en' ? 'Turn revelation into cost, exposure, deterioration, and narrowing options.' : 'Transforme revela??o em custo, exposi??o, deteriora??o e estreitamento de op??es.', chapterStart: actTwoEnd + 1, chapterEnd: actThreeEnd, milestone: actMilestones[2] },
+        { actIndex: 4, label: lang === 'en' ? 'Act III' : 'Ato III', purpose: lang === 'en' ? 'Converge surviving forces into collision, consequence, and aftermath.' : 'Converja as for?as sobreviventes em colis?o, consequ?ncia e desfecho.', chapterStart: actThreeEnd + 1, chapterEnd: targetChapters, milestone: actMilestones[3] },
+    ];
+    const chapterGoalSeeds = lang === 'en'
+        ? [
+            `Show ${protagonistName} inside the fragile routine of ${initialSetting} while the first sign of ${anchors.ruleA} threatens to expose the conflict hidden inside ${conflict}.`,
+            `Force ${protagonistName} to cross into the zone controlled by ${anchors.factionB}, breaking a taboo that cannot be undone quietly.`,
+            `Make retreat impossible by tying ${protagonistName}'s safety to a witness, relic, or secret linked to ${anchors.timelineA}.`,
+            `Expose a concrete move by ${anchors.factionA} that turns the conflict from rumor into organized violence.`,
+            `Push ${protagonistName} to learn, steal, or survive one specific rule of ${anchors.ruleA} under immediate risk.`,
+            `Turn an apparent ally into a liability by revealing their hidden tie to ${anchors.factionB} or ${anchors.ruleB}.`,
+            `Make loyalty, desire, and survival collide through a relationship strained by demands from ${anchors.factionA} and ${anchors.factionB}.`,
+            `Reveal a fact about ${anchors.timelineA} that directly reframes the protagonist's Lie and contaminates the next choice.`,
+            `Deliver a midpoint truth that identifies what ${anchors.ruleA} really does and why both factions are willing to spill blood for it.`,
+            `Transform that truth into visible social, spiritual, or physical punishment centered on ${initialSetting}.`,
+            `Escalate pressure as factions, rituals, or institutions move openly around ${anchors.ruleB}.`,
+            `Destroy the refuge, cover story, or alliance protecting ${protagonistName}, and tie the collapse to ${anchors.factionA}.`,
+            `Narrow the road until sacrifice means losing a person, place, or oath anchored in ${anchors.timelineA}.`,
+            `Prepare the final collision by exposing the exact price of defeating ${anchors.factionB} and the truth ${protagonistName} still refuses to name.`,
+            `Drive the surviving forces into the same arena, forcing ${protagonistName} to choose who will be betrayed, saved, or abandoned.`,
+            `Stage the climax through direct confrontation with whoever wields ${anchors.ruleA}.`,
+            `Show what remains of the world, the bonds, and the self after the order around ${initialSetting} has been rewritten.`,
+        ]
+        : [
+            `Mostre ${protagonistName} dentro da rotina fr?gil de ${initialSetting}, enquanto o primeiro sinal de ${anchors.ruleA} amea?a expor o conflito escondido em ${conflict}.`,
+            `Force ${protagonistName} a cruzar para a zona controlada por ${anchors.factionB}, quebrando um tabu que n?o pode ser desfeito em sil?ncio.`,
+            `Torne a retirada imposs?vel ao ligar a seguran?a de ${protagonistName} a uma testemunha, rel?quia ou segredo conectado a ${anchors.timelineA}.`,
+            `Exponha um movimento concreto de ${anchors.factionA} que transforma o conflito de rumor em viol?ncia organizada.`,
+            `Empurre ${protagonistName} a aprender, roubar ou sobreviver a uma regra espec?fica de ${anchors.ruleA} sob risco imediato.`,
+            `Transforme um aliado aparente em problema ao revelar seu v?nculo oculto com ${anchors.factionB} ou ${anchors.ruleB}.`,
+            `Fa?a lealdade, desejo e sobreviv?ncia colidirem por meio de uma rela??o pressionada ao mesmo tempo por ${anchors.factionA} e ${anchors.factionB}.`,
+            `Revele um fato sobre ${anchors.timelineA} que reinterpreta diretamente a Lie do protagonista e contamina a pr?xima escolha.`,
+            `Entregue no midpoint a verdade sobre o que ${anchors.ruleA} realmente faz e por que as duas fac??es aceitariam sangrar por isso.`,
+            `Transforme essa verdade em puni??o social, espiritual ou f?sica vis?vel, centrada em ${initialSetting}.`,
+            `Aumente a press?o quando fac??es, rituais ou institui??es passam a agir abertamente ao redor de ${anchors.ruleB}.`,
+            `Destrua o ref?gio, a cobertura ou a alian?a que protegia ${protagonistName}, ligando o colapso a ${anchors.factionA}.`,
+            `Aperte o caminho at? o sacrif?cio significar perder uma pessoa, lugar ou juramento ancorado em ${anchors.timelineA}.`,
+            `Prepare a colis?o final expondo o pre?o exato de derrotar ${anchors.factionB} e a verdade que ${protagonistName} ainda se recusa a nomear.`,
+            `Leve as for?as sobreviventes para a mesma arena e obrigue ${protagonistName} a escolher quem ser? tra?do, salvo ou abandonado.`,
+            `Encene o cl?max por confronto direto com quem controla ${anchors.ruleA}.`,
+            `Mostre o que resta do mundo, dos v?nculos e do eu depois que a ordem em ${initialSetting} foi reescrita.`,
+        ];
+
+    const chapterMap = chapterFunctions.map((fn, index) => {
+        const chapterNumber = index + 1;
+        const actIndex = chapterNumber <= actOneEnd ? 1 : chapterNumber <= actTwoEnd ? 2 : chapterNumber <= actThreeEnd ? 3 : 4;
+        const fallbackGoal = lang === 'en'
+            ? `${LONGFORM_FUNCTION_LABELS[fn]}: force ${protagonistName} into a named cost, revelation, or irreversible move tied to ${anchors.ruleA}.`
+            : `${LONGFORM_FUNCTION_LABELS[fn]}: force ${protagonistName} a pagar um custo nomeado, receber uma revela??o concreta ou agir sem volta em torno de ${anchors.ruleA}.`;
+        return {
+            chapterNumber,
+            actIndex,
+            function: fn,
+            goal: chapterGoalSeeds[index] || fallbackGoal,
+            milestone: chapterNumber === milestoneChapters[0] ? actMilestones[0]
+                : chapterNumber === milestoneChapters[1] ? actMilestones[1]
+                : chapterNumber === milestoneChapters[2] ? actMilestones[2]
+                : chapterNumber === milestoneChapters[3] ? actMilestones[3]
+                : undefined,
+        };
+    });
+
+    return {
+        title,
+        logline,
+        promise,
+        conflictCore: conflict,
+        protagonistFocus: protagonist?.coreLie
+            ? (lang === 'en' ? `${protagonistName} must confront the Lie that ${protagonist.coreLie}` : `${protagonistName} precisa confrontar a Lie de que ${protagonist.coreLie}`)
+            : (protagonist?.bio?.trim() || protagonistName),
+        targetChapters,
+        minChapters: 15,
+        maxChapters: 20,
+        acts,
+        milestones: [
+            { chapter: milestoneChapters[0], label: lang === 'en' ? 'Act I Lock' : 'Fecho do Ato I', objective: actMilestones[0] },
+            { chapter: milestoneChapters[1], label: lang === 'en' ? 'Midpoint Turn' : 'Virada do Midpoint', objective: actMilestones[1] },
+            { chapter: milestoneChapters[2], label: lang === 'en' ? 'Final Descent' : 'Descida Final', objective: actMilestones[2] },
+            { chapter: milestoneChapters[3], label: lang === 'en' ? 'Resolution' : 'Resolu??o', objective: actMilestones[3] },
+        ],
+        chapterMap,
+    };
+};
+const normalizeThemeKey = (value: string): string =>
+    value
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase();
+
+const buildLongformBlueprintDirectives = (profile: StoryProfile | undefined, lang: 'pt' | 'en') => {
+    const themes = (profile?.themes ?? []).map(normalizeThemeKey);
+    const archetypes = profile?.archetypes ?? [];
+    const tone = normalizeThemeKey(profile?.tone ?? '');
+    const pov = profile?.pov;
+
+    const model = archetypes.includes('isekai')
+        ? 'isekai progression using Save the Cat opening displacement, Hero’s Journey threshold crossing, midpoint rule revelation, and late belonging choice'
+        : archetypes.includes('noir')
+            ? 'investigation-noir using Fichtean pressure, clue laddering, corruption spiral, and late moral reversal'
+            : archetypes.includes('romance_gothico')
+                ? 'gothic arc using haunted-house escalation, secrecy lattice, forbidden intimacy beats, and inheritance revelation'
+                : archetypes.includes('opera_espacial')
+                    ? 'space-opera escalation using converging faction fronts, diplomatic reversals, midpoint scale expansion, and war-cost climax'
+                    : archetypes.includes('shakespeare')
+                        ? 'tragic reversal arc using fatal contradiction, dramatic irony, cascading misunderstanding, and cathartic downfall'
+                        : 'hybrid longform structure using Save the Cat beats, Seven-Point Story Structure, scene-sequel rhythm, and a strong midpoint turn';
+
+    const directivesPt: string[] = [];
+    const directivesEn: string[] = [];
+
+    directivesPt.push('TÉCNICA ESTRUTURAL: escolha conscientemente 1-2 frameworks entre Save the Cat, Seven-Point Story Structure, Hero’s Journey, Fichtean curve, Kishotenketsu ou scene-sequel rhythm. Use-os de verdade na distribuição dos atos e marcos, sem citar teoria no texto final.');
+    directivesEn.push('STRUCTURAL CRAFT: deliberately choose 1-2 frameworks from Save the Cat, Seven-Point Story Structure, Hero’s Journey, Fichtean curve, Kishotenketsu, or scene-sequel rhythm. Actually use them in act and milestone distribution without naming theory in the final text.');
+
+    if (tone.includes('sombrio') || tone.includes('dark')) {
+        directivesPt.push('TOM SOMBRIO: midpoint e ato final devem cobrar perda, custo, degradação e ausência de redenção fácil.');
+        directivesEn.push('DARK TONE: midpoint and final act must demand loss, cost, deterioration, and no easy redemption.');
+    }
+    if (tone.includes('epico') || tone.includes('epic')) {
+        directivesPt.push('TOM ÉPICO: escale de conflito pessoal para implicação coletiva, política ou civilizacional até o clímax.');
+        directivesEn.push('EPIC TONE: escalate from personal conflict toward collective, political, or civilizational stakes by the climax.');
+    }
+    if (tone.includes('misterioso') || tone.includes('mysterious')) {
+        directivesPt.push('TOM MISTERIOSO: distribua perguntas e revelações em camadas; cada ato deve responder algo e abrir outra pergunta maior.');
+        directivesEn.push('MYSTERIOUS TONE: distribute questions and revelations in layers; each act must answer something and open a larger question.');
+    }
+    if (tone.includes('dramatico') || tone.includes('dramatic')) {
+        directivesPt.push('TOM DRAMÁTICO: pelo menos uma relação central deve mudar de estado em cada ato.');
+        directivesEn.push('DRAMATIC TONE: at least one core relationship must change state in each act.');
+    }
+    if (tone.includes('humoristico') || tone.includes('humorous')) {
+        directivesPt.push('TOM HUMORÍSTICO: inclua reversões irônicas, contraste e alívio sem desmontar a pressão central.');
+        directivesEn.push('HUMOROUS TONE: include ironic reversals, contrast, and relief without dissolving core pressure.');
+    }
+    if (tone.includes('lirico') || tone.includes('lyrical')) {
+        directivesPt.push('TOM LÍRICO: preserve a clareza estrutural, mas permita marcos com forte peso imagético e simbólico.');
+        directivesEn.push('LYRICAL TONE: preserve structural clarity while allowing milestones with strong imagistic and symbolic weight.');
+    }
+
+    if (themes.includes('redencao')) {
+        directivesPt.push('TEMA REDENÇÃO: o protagonista deve enfrentar culpa, falhar moralmente e só poder reparar algo depois de pagar custo real.');
+        directivesEn.push('REDEMPTION THEME: the protagonist must face guilt, fail morally, and only earn repair after paying real cost.');
+    }
+    if (themes.includes('poder_e_corrupcao')) {
+        directivesPt.push('TEMA PODER E CORRUPÇÃO: cada ganho de poder precisa vir com deformação ética, dependência ou risco de desumanização.');
+        directivesEn.push('POWER & CORRUPTION THEME: every power gain must carry ethical distortion, dependency, or dehumanizing risk.');
+    }
+    if (themes.includes('amor_proibido')) {
+        directivesPt.push('TEMA AMOR PROIBIDO: introduza vínculo afetivo sob barreira real e faça o custo dessa ligação aumentar por ato.');
+        directivesEn.push('FORBIDDEN LOVE THEME: introduce an emotional bond under a real barrier and increase its cost each act.');
+    }
+    if (themes.includes('identidade')) {
+        directivesPt.push('TEMA IDENTIDADE: midpoint ou virada do ato 2 deve quebrar a autoimagem do protagonista.');
+        directivesEn.push('IDENTITY THEME: the midpoint or late act-two turn must break the protagonist’s self-image.');
+    }
+    if (themes.includes('vinganca')) {
+        directivesPt.push('TEMA VINGANÇA: a busca retaliatória deve ganhar um preço moral claro e disputar espaço com outras lealdades.');
+        directivesEn.push('VENGEANCE THEME: the retaliatory drive must incur a clear moral price and compete with other loyalties.');
+    }
+    if (themes.includes('revolucao')) {
+        directivesPt.push('TEMA REVOLUÇÃO: mostre custo sistêmico, facções em conflito e ausência de solução moral simples.');
+        directivesEn.push('REVOLUTION THEME: show systemic cost, factions in conflict, and no morally simple solution.');
+    }
+    if (themes.includes('sobrevivencia')) {
+        directivesPt.push('TEMA SOBREVIVÊNCIA: todo bloco precisa pressionar recursos, tempo, risco físico ou abrigo.');
+        directivesEn.push('SURVIVAL THEME: every block must pressure resources, time, physical risk, or shelter.');
+    }
+    if (themes.includes('traicao')) {
+        directivesPt.push('TEMA TRAIÇÃO: plante sementes cedo e exija ao menos uma ruptura importante de confiança.');
+        directivesEn.push('BETRAYAL THEME: plant seeds early and require at least one major rupture of trust.');
+    }
+
+    if (archetypes.includes('isekai')) {
+        directivesPt.push('ISEKAI: o blueprint deve conter ruptura explícita entre mundo comum e mundo outro. Capítulos 1-2 precisam cobrir morte/reencarnação, convocação/transporte ou aprisionamento em outro mundo; o ato 1 precisa ensinar as regras do novo mundo; o midpoint precisa revelar por que o protagonista foi parar ali; o ato final precisa forçar escolha entre pertencer, voltar ou reescrever os dois mundos.');
+        directivesEn.push('ISEKAI: the blueprint must contain an explicit rupture between ordinary world and other world. Chapters 1-2 must cover death/reincarnation, summoning/transport, or entrapment in another world; act one must teach the new world’s rules; the midpoint must reveal why the protagonist arrived there; the final act must force a choice between belonging, returning, or rewriting both worlds.');
+    }
+    if (archetypes.includes('noir')) {
+        directivesPt.push('NOIR: inclua investigação, corrupção em camadas, ambiguidade moral e uma verdade tardia que custe algo ao protagonista.');
+        directivesEn.push('NOIR: include investigation, layered corruption, moral ambiguity, and a late truth that costs the protagonist something.');
+    }
+    if (archetypes.includes('romance_gothico')) {
+        directivesPt.push('GÓTICO: use segredo de linhagem, casa/instituição decadente, intimidade proibida e sensação de herança maldita.');
+        directivesEn.push('GOTHIC: use lineage secrets, a decaying house/institution, forbidden intimacy, and the sense of cursed inheritance.');
+    }
+    if (archetypes.includes('opera_espacial')) {
+        directivesPt.push('SPACE OPERA: distribua conflito entre facções, escala interestelar, diplomacia tensa e promessa de expansão de arena.');
+        directivesEn.push('SPACE OPERA: distribute conflict across factions, interstellar scale, tense diplomacy, and the promise of expanding arena.');
+    }
+    if (archetypes.includes('realismo_magico')) {
+        directivesPt.push('REALISMO MÁGICO: o sobrenatural deve coexistir com o cotidiano sem virar tutorial de sistema rígido.');
+        directivesEn.push('MAGICAL REALISM: the supernatural must coexist with the ordinary without turning into a rigid system tutorial.');
+    }
+    if (archetypes.includes('dostoevski')) {
+        directivesPt.push('DRAMA PSICOLÓGICO: aumente contradições internas, culpa, autoengano e dilemas sem saída limpa.');
+        directivesEn.push('PSYCHOLOGICAL DRAMA: intensify inner contradiction, guilt, self-deception, and dilemmas without clean exits.');
+    }
+    if (archetypes.includes('tolkien')) {
+        directivesPt.push('HIGH FANTASY: deixe claro o pano de fundo mítico, a história profunda do mundo e a relação entre facções, legado e cosmologia.');
+        directivesEn.push('HIGH FANTASY: make the mythic backdrop, deep history, and relation between factions, legacy, and cosmology explicit.');
+    }
+    if (archetypes.includes('shakespeare')) {
+        directivesPt.push('TRAGÉDIA CLÁSSICA: faça o blueprint caminhar para ironia, erro fatal e catarse, não apenas para vitória limpa.');
+        directivesEn.push('CLASSICAL TRAGEDY: drive the blueprint toward irony, fatal error, and catharsis, not merely clean victory.');
+    }
+
+    if (pov === 'primeira_pessoa') {
+        directivesPt.push('POV PRIMEIRA PESSOA: organize revelações para o leitor descobrir o mundo pelos limites subjetivos do protagonista.');
+        directivesEn.push('FIRST-PERSON POV: structure revelations so the reader discovers the world through the protagonist’s subjective limits.');
+    } else if (pov === 'terceiro_limitado') {
+        directivesPt.push('POV TERCEIRO LIMITADO: mantenha foco concentrado e segure informações fora do alcance imediato do protagonista.');
+        directivesEn.push('THIRD-LIMITED POV: keep focus concentrated and withhold information beyond the protagonist’s immediate reach.');
+    } else if (pov === 'terceiro_onisciente') {
+        directivesPt.push('POV TERCEIRO ONISCIENTE: permita ironia dramática e contraponto entre facções, mas sem dissolver a linha principal do protagonista.');
+        directivesEn.push('THIRD-OMNISCIENT POV: allow dramatic irony and factional counterpoint without dissolving the protagonist’s main line.');
+    }
+
+    return {
+        model,
+        directivesText: lang === 'en'
+            ? directivesEn.join('\n- ')
+            : directivesPt.join('\n- '),
+    };
+};
+
+const buildCompactLongformBlueprintDirectives = (profile: StoryProfile | undefined, lang: 'pt' | 'en') => {
+    const themes = (profile?.themes ?? []).map(normalizeThemeKey);
+    const archetypes = profile?.archetypes ?? [];
+    const tone = normalizeThemeKey(profile?.tone ?? '');
+    const pov = profile?.pov;
+
+    const model = archetypes.includes('isekai')
+        ? 'isekai rupture -> threshold -> world-secret -> belonging choice'
+        : archetypes.includes('noir')
+            ? 'investigation spiral -> corruption ladder -> moral reversal'
+            : archetypes.includes('romance_gothico')
+                ? 'gothic secrecy -> forbidden intimacy -> inheritance reveal'
+                : archetypes.includes('opera_espacial')
+                    ? 'faction escalation -> diplomatic reversals -> war-cost climax'
+                    : archetypes.includes('shakespeare')
+                        ? 'tragic contradiction -> irony -> downfall -> catharsis'
+                        : '4-act escalation with a strong midpoint and earned aftermath';
+
+    const directivesPt: string[] = ['Escolha 1-2 frameworks e aplique-os de verdade na distribuição dos atos.'];
+    const directivesEn: string[] = ['Choose 1-2 frameworks and actually apply them to act distribution.'];
+
+    if (tone.includes('sombrio') || tone.includes('dark')) {
+        directivesPt.push('Cobre perda real no midpoint e no ato final.');
+        directivesEn.push('Charge real loss at the midpoint and in the final act.');
+    }
+    if (tone.includes('epico') || tone.includes('epic')) {
+        directivesPt.push('Escale para impacto coletivo ou civilizacional.');
+        directivesEn.push('Escalate toward collective or civilizational stakes.');
+    }
+    if (tone.includes('misterioso') || tone.includes('mysterious')) {
+        directivesPt.push('Cada ato responde uma pergunta e abre outra maior.');
+        directivesEn.push('Each act answers one question and opens a larger one.');
+    }
+    if (tone.includes('dramatico') || tone.includes('dramatic')) {
+        directivesPt.push('Faça ao menos uma relação central mudar por ato.');
+        directivesEn.push('Make at least one core relationship change each act.');
+    }
+
+    if (themes.includes('identidade')) {
+        directivesPt.push('Frature a autoimagem do protagonista no midpoint ou fim do ato 2.');
+        directivesEn.push('Fracture the protagonist self-image at the midpoint or late act two.');
+    }
+    if (themes.includes('redencao')) {
+        directivesPt.push('A reparação só vem depois de culpa, falha e custo.');
+        directivesEn.push('Repair only comes after guilt, failure, and cost.');
+    }
+    if (themes.includes('poder_e_corrupcao')) {
+        directivesPt.push('Todo ganho de poder precisa deformar algo humano.');
+        directivesEn.push('Every power gain must deform something human.');
+    }
+    if (themes.includes('amor_proibido')) {
+        directivesPt.push('Faça o vínculo proibido ficar mais caro a cada ato.');
+        directivesEn.push('Make the forbidden bond costlier each act.');
+    }
+    if (themes.includes('vinganca')) {
+        directivesPt.push('A vingança deve competir com outras lealdades.');
+        directivesEn.push('Vengeance must compete with other loyalties.');
+    }
+    if (themes.includes('revolucao')) {
+        directivesPt.push('Mostre custo sistêmico e facções em choque.');
+        directivesEn.push('Show systemic cost and clashing factions.');
+    }
+    if (themes.includes('sobrevivencia')) {
+        directivesPt.push('Pressione tempo, recurso, abrigo ou risco físico em cada bloco.');
+        directivesEn.push('Pressure time, resources, shelter, or physical risk in every block.');
+    }
+    if (themes.includes('traicao')) {
+        directivesPt.push('Plante cedo a ruptura de confiança e cobre-a depois.');
+        directivesEn.push('Plant the trust rupture early and collect on it later.');
+    }
+
+    if (archetypes.includes('isekai')) {
+        directivesPt.push('Capítulos 1-2 devem cobrir a ruptura entre mundos.');
+        directivesEn.push('Chapters 1-2 must cover the rupture between worlds.');
+    }
+    if (archetypes.includes('noir')) {
+        directivesPt.push('Inclua investigação, corrupção em camadas e verdade tardia com custo.');
+        directivesEn.push('Include investigation, layered corruption, and a costly late truth.');
+    }
+    if (archetypes.includes('romance_gothico')) {
+        directivesPt.push('Use decadência, segredo e intimidade proibida.');
+        directivesEn.push('Use decay, secrecy, and forbidden intimacy.');
+    }
+    if (archetypes.includes('opera_espacial')) {
+        directivesPt.push('Distribua pressão entre facções, arena ampla e diplomacia tensa.');
+        directivesEn.push('Distribute pressure across factions, broad arena, and tense diplomacy.');
+    }
+    if (archetypes.includes('realismo_magico')) {
+        directivesPt.push('O sobrenatural deve coexistir com o cotidiano sem tutorial de sistema.');
+        directivesEn.push('The supernatural must coexist with the ordinary without a system tutorial.');
+    }
+    if (archetypes.includes('dostoevski')) {
+        directivesPt.push('Aumente culpa, autoengano e contradição interna.');
+        directivesEn.push('Intensify guilt, self-deception, and inner contradiction.');
+    }
+    if (archetypes.includes('tolkien')) {
+        directivesPt.push('Deixe explícitos legado, profundidade histórica e pano de fundo mítico.');
+        directivesEn.push('Make legacy, deep history, and mythic backdrop explicit.');
+    }
+    if (archetypes.includes('shakespeare')) {
+        directivesPt.push('Conduza para ironia, erro fatal e catarse.');
+        directivesEn.push('Drive toward irony, fatal error, and catharsis.');
+    }
+
+    if (pov === 'primeira_pessoa') {
+        directivesPt.push('Passe as revelações pelos limites subjetivos do protagonista.');
+        directivesEn.push('Route revelations through the protagonist subjective limits.');
+    } else if (pov === 'terceiro_limitado') {
+        directivesPt.push('Segure informação fora do alcance imediato do protagonista.');
+        directivesEn.push('Withhold information beyond the protagonist immediate reach.');
+    } else if (pov === 'terceiro_onisciente') {
+        directivesPt.push('Permita contraponto entre facções sem dissolver a linha principal.');
+        directivesEn.push('Allow factional counterpoint without dissolving the main line.');
+    }
+
+    return {
+        model,
+        directivesText: lang === 'en'
+            ? directivesEn.slice(0, 8).join('\n- ')
+            : directivesPt.slice(0, 8).join('\n- '),
+    };
+};
+
+const getBlueprintChapterMeta = (blueprint: LongformBlueprint | undefined, chapterNumber: number) =>
+    blueprint?.chapterMap.find(entry => entry.chapterNumber === chapterNumber) ?? null;
+
 const langMandate = (lang?: 'pt' | 'en'): string => {
     if (lang === 'en') {
         return 'Write everything in English only.';
     }
-    return 'Escreva tudo em português brasileiro. Não misture inglês no texto.';
+    return 'Escreva tudo em português brasileiro. Não misture inglês no texto. Use acentuação correta quando necessário. Referência rápida: ação, coração, órbita, capítulo, memória, estação, ficção, bênção, impossível.';
 };
 
 const langMandateVerbose = (lang?: 'pt' | 'en'): string => {
@@ -544,6 +1239,152 @@ const stripCodeFences = (value: string): string =>
         .replace(/\s*```$/i, '')
         .trim();
 
+const TEXT_REPAIR_RULES: Array<[RegExp, string]> = [
+    [/Ã¡/g, 'á'], [/Ã /g, 'à'], [/Ã¢/g, 'â'], [/Ã£/g, 'ã'], [/Ã¤/g, 'ä'],
+    [/Ã©/g, 'é'], [/Ãª/g, 'ê'], [/Ã¨/g, 'è'],
+    [/Ã­/g, 'í'], [/Ã¬/g, 'ì'], [/Ã®/g, 'î'],
+    [/Ã³/g, 'ó'], [/Ã´/g, 'ô'], [/Ãµ/g, 'õ'], [/Ã¶/g, 'ö'],
+    [/Ãº/g, 'ú'], [/Ã¹/g, 'ù'], [/Ã»/g, 'û'], [/Ã¼/g, 'ü'],
+    [/Ã§/g, 'ç'], [/Ã‘/g, 'Ñ'], [/Ã±/g, 'ñ'],
+    [/â€™/g, "'"], [/â€œ/g, '"'], [/â€/g, '"'], [/â€“/g, '-'], [/â€”/g, '—'], [/â€¦/g, '...'],
+    [/Â·/g, '·'], [/Â/g, ''],
+    [/press\?o/gi, 'pressão'], [/consequ\?ncia/gi, 'consequência'], [/seguran\?a/gi, 'segurança'],
+    [/inevit\?vel/gi, 'inevitável'], [/revela\?\?/gi, 'revelação'], [/exp\?e/gi, 'expõe'],
+    [/fac\?\?/gi, 'facções'], [/v\?nculos/gi, 'vínculos'], [/v\?nculo/gi, 'vínculo'],
+    [/exposi\?\?/gi, 'exposição'], [/deteriora\?\?/gi, 'deterioração'], [/op\?\?es/gi, 'opções'],
+    [/for\?as/gi, 'forças'], [/colis\?o/gi, 'colisão'], [/fr\?gil/gi, 'frágil'], [/amea\?a/gi, 'ameaça'],
+    [/\bn\?o\b/gi, 'não'], [/sil\?ncio/gi, 'silêncio'], [/pr\?xima/gi, 'próxima'], [/puni\?\?/gi, 'punição'],
+    [/ref\?gio/gi, 'refúgio'], [/alian\?a/gi, 'aliança'], [/at\?/gi, 'até'], [/pre\?o/gi, 'preço'],
+    [/ser\?/gi, 'será'], [/tra\?do/gi, 'traído'], [/cap\?tulo/gi, 'capítulo'], [/estabele\?a/gi, 'estabeleça'],
+];
+
+const repairTextArtifacts = (value: string): string => {
+    let next = value;
+    for (const [pattern, replacement] of TEXT_REPAIR_RULES) {
+        next = next.replace(pattern, replacement);
+    }
+    return next;
+};
+
+const hasMeaningfulFallback = (fallback: unknown): boolean => {
+    if (fallback == null) return false;
+    if (typeof fallback === 'string') return fallback.trim().length > 0;
+    if (Array.isArray(fallback)) return fallback.length > 0;
+    if (typeof fallback === 'object') return Object.keys(fallback as Record<string, unknown>).length > 0;
+    return true;
+};
+
+const deepRepairTextArtifacts = <T,>(value: T): T => {
+    if (typeof value === 'string') {
+        return repairTextArtifacts(value) as T;
+    }
+    if (Array.isArray(value)) {
+        return value.map(item => deepRepairTextArtifacts(item)) as T;
+    }
+    if (value && typeof value === 'object') {
+        const repairedEntries = Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, deepRepairTextArtifacts(entry)]);
+        return Object.fromEntries(repairedEntries) as T;
+    }
+    return value;
+};
+
+const shouldAttemptBlueprintTranslationPass = (label?: string): boolean => {
+    if (!label) return false;
+    const normalized = label.toLowerCase();
+    return normalized.includes('blueprint') && !normalized.includes('json repair');
+};
+
+const translateRawBlueprintJson = async <T>({
+    raw,
+    fallback,
+    schema,
+    label,
+}: {
+    raw: string;
+    fallback: T;
+    schema?: z.ZodType<T>;
+    label?: string;
+}): Promise<T | null> => {
+    const keys = loadApiKeys();
+    const preferred = keys?.preferredProvider ?? 'auto';
+    const preferredCandidate =
+        preferred === 'cerebras' && keys?.cerebras?.trim() ? 'cerebras'
+        : preferred === 'openrouter' && keys?.openrouter?.trim() ? 'openrouter'
+        : preferred === 'groq' && keys?.groq?.trim() ? 'groq'
+        : preferred === 'gemini' && keys?.gemini?.trim() ? 'gemini'
+        : null;
+    const candidateProviders = Array.from(new Set<Array<'cerebras' | 'groq' | 'openrouter' | 'gemini'>[number]>([
+        ...(preferredCandidate ? [preferredCandidate] : []),
+        ...(keys?.openrouter?.trim() ? ['openrouter' as const] : []),
+        ...(keys?.cerebras?.trim() ? ['cerebras' as const] : []),
+        ...(keys?.groq?.trim() ? ['groq' as const] : []),
+        ...(keys?.gemini?.trim() ? ['gemini' as const] : []),
+    ]));
+
+    if (candidateProviders.length === 0) return null;
+
+    const repairedFallback = deepRepairTextArtifacts(fallback);
+    try {
+        const locallyParsed = deepRepairTextArtifacts(safeJsonParse<T>(raw));
+        if (!schema) return locallyParsed;
+
+        const mergedLocalCandidate =
+            locallyParsed && typeof locallyParsed === 'object' && !Array.isArray(locallyParsed) &&
+            repairedFallback && typeof repairedFallback === 'object' && !Array.isArray(repairedFallback)
+                ? deepRepairTextArtifacts({ ...(repairedFallback as object), ...(locallyParsed as object) })
+                : locallyParsed;
+
+        const localValidation = schema.safeParse(mergedLocalCandidate);
+        if (localValidation.success) return deepRepairTextArtifacts(localValidation.data);
+    } catch {
+        // Only spend another model call if local JSON recovery truly fails.
+    }
+
+    const repairPrompt = [
+        'You will receive raw JSON text produced by another model.',
+        'Your job is only to normalize the language and encoding of that exact output.',
+        'Return ONLY valid JSON.',
+        'Do not add, remove, or invent story content.',
+        'Preserve the same keys, hierarchy, and intended meaning.',
+        'Fix Portuguese accents, mojibake, duplicated suffixes, punctuation damage, and malformed string text.',
+        'If needed, minimally repair JSON syntax so the object becomes valid.',
+        'Use this object only as a schema reference:',
+        JSON.stringify(repairedFallback, null, 2),
+        'Raw JSON text to normalize:',
+        repairTextArtifacts(stripCodeFences(raw)),
+    ].join('\n\n');
+
+    for (const candidateProvider of candidateProviders) {
+            try {
+            const repairedRaw = await chat({
+                user: repairPrompt,
+                json: false,
+                temperature: 0,
+                maxTokens: 2200,
+                label: `${label ?? 'Structured Output'} · JSON Repair`,
+                provider: candidateProvider,
+            });
+            if (!repairedRaw) continue;
+
+            const parsed = deepRepairTextArtifacts(safeJsonParse<T>(repairedRaw));
+            if (!schema) return parsed;
+
+            const mergedCandidate =
+                parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
+                repairedFallback && typeof repairedFallback === 'object' && !Array.isArray(repairedFallback)
+                    ? deepRepairTextArtifacts({ ...(repairedFallback as object), ...(parsed as object) })
+                    : parsed;
+
+            const validation = schema.safeParse(mergedCandidate);
+            if (validation.success) return deepRepairTextArtifacts(validation.data);
+        } catch (repairError) {
+            console.warn(`[MythosEngine] ${label ?? 'Structured Output'} JSON repair via ${candidateProvider} failed.`, repairError instanceof Error ? repairError.message : repairError);
+        }
+    }
+
+    return null;
+};
+
 const repairJson = (raw: string): string => {
     // Strategy 1: remove trailing commas before } or ]
     let s = raw.replace(/,\s*([\}\]])/g, '$1');
@@ -560,22 +1401,82 @@ const repairJson = (raw: string): string => {
         else if (ch === '[') stack.push(']');
         else if ((ch === '}' || ch === ']') && stack.length) stack.pop();
     }
+    if (escape && s.endsWith('\\')) {
+        s = s.slice(0, -1);
+    }
+    if (inString) {
+        s += '"';
+    }
     s += stack.reverse().join('');
     return s;
 };
 
+const extractBalancedJsonCandidates = (raw: string): string[] => {
+    const candidates: string[] = [];
+    let inString = false;
+    let escape = false;
+    const stack: string[] = [];
+    let start = -1;
+
+    for (let i = 0; i < raw.length; i++) {
+        const ch = raw[i];
+        if (escape) { escape = false; continue; }
+        if (ch === '\\' && inString) { escape = true; continue; }
+        if (ch === '"') { inString = !inString; continue; }
+        if (inString) continue;
+
+        if ((ch === '{' || ch === '[') && stack.length === 0) {
+            start = i;
+        }
+
+        if (ch === '{') stack.push('}');
+        else if (ch === '[') stack.push(']');
+        else if ((ch === '}' || ch === ']') && stack.length) {
+            const expected = stack.pop();
+            if (expected !== ch) {
+                stack.length = 0;
+                start = -1;
+                continue;
+            }
+            if (stack.length === 0 && start !== -1) {
+                candidates.push(raw.slice(start, i + 1));
+                start = -1;
+            }
+        }
+    }
+
+    return candidates;
+};
+
+const summarizeRawModelOutput = (raw: string): string => {
+    const cleaned = repairTextArtifacts(stripCodeFences(raw));
+    const head = cleaned.slice(0, 500);
+    const tail = cleaned.length > 500 ? cleaned.slice(-500) : '';
+    return [
+        `RAW_LENGTH=${cleaned.length}`,
+        'RAW_HEAD:',
+        head,
+        ...(tail ? ['RAW_TAIL:', tail] : []),
+    ].join('\n');
+};
+
 const safeJsonParse = <T>(value: string): T => {
-    const cleaned = stripCodeFences(value);
+    const cleaned = repairTextArtifacts(stripCodeFences(value));
     // Attempt 1: direct parse
-    try { return JSON.parse(cleaned) as T; } catch {}
+    try { return deepRepairTextArtifacts(JSON.parse(cleaned) as T); } catch {}
     // Attempt 2: repair common malformations
-    try { return JSON.parse(repairJson(cleaned)) as T; } catch {}
-    // Attempt 3: extract first JSON object/array with brute-force slice
+    try { return deepRepairTextArtifacts(JSON.parse(repairJson(cleaned)) as T); } catch {}
+    // Attempt 3: parse any balanced top-level JSON object/array embedded in the text.
+    for (const candidate of extractBalancedJsonCandidates(cleaned).reverse()) {
+        try { return deepRepairTextArtifacts(JSON.parse(candidate) as T); } catch {}
+        try { return deepRepairTextArtifacts(JSON.parse(repairJson(candidate)) as T); } catch {}
+    }
+    // Attempt 4: extract first JSON object/array with brute-force slice
     try {
         const start = cleaned.search(/[\[{]/);
         if (start !== -1) {
             const lastBrace = Math.max(cleaned.lastIndexOf('}'), cleaned.lastIndexOf(']'));
-            if (lastBrace > start) return JSON.parse(cleaned.slice(start, lastBrace + 1)) as T;
+            if (lastBrace > start) return deepRepairTextArtifacts(JSON.parse(cleaned.slice(start, lastBrace + 1)) as T);
         }
     } catch {}
     throw new SyntaxError('JSON parse failed after repair attempts');
@@ -617,26 +1518,46 @@ const chat = async ({
     messages.push({ role: 'user', content: user });
 
     const defaultTemp = temperature ?? (json ? 0.4 : 0.8);
-    const preferredProvider = provider === 'auto' ? (keys?.preferredProvider ?? 'auto') : provider;
+    const preferredProvider = provider === 'auto'
+        ? ((keys?.preferredProvider ?? 'auto') === 'auto'
+            ? (keys?.cerebras?.trim() ? 'cerebras' : 'auto')
+            : (keys?.preferredProvider ?? 'auto'))
+        : provider;
+    let cerebrasAlreadyTried = false;
     const executeOpenRouter = async (withJsonMode: boolean, modelOverride?: string): Promise<string> => {
         const openRouterClient = getOpenRouterClient();
         if (!openRouterClient) throw new Error('OPENROUTER_API_KEY not configured.');
-        const openRouterModel = modelOverride ?? OPENROUTER_DEFAULT_MODEL;
-        const completion = await openRouterClient.chat.completions.create({
-            model: openRouterModel,
-            messages,
-            temperature: defaultTemp,
-            ...(withJsonMode ? { response_format: { type: 'json_object' } } : {}),
-            ...(maxTokens ? { max_tokens: maxTokens } : {}),
-        });
-        const u = completion.usage;
-        if (u) emitUsage({ provider: 'openrouter', model: openRouterModel, label, inputTokens: u.prompt_tokens, outputTokens: u.completion_tokens, totalTokens: u.total_tokens });
-        return extractText(completion.choices[0]?.message?.content).trim();
+        const routeConfig = getOpenRouterRouteConfig(label, withJsonMode);
+        const openRouterModels = modelOverride
+            ? [modelOverride, ...routeConfig.fallbacks.filter(candidate => candidate !== modelOverride)]
+            : [routeConfig.primary, ...routeConfig.fallbacks];
+        let lastError: unknown = null;
+        for (const openRouterCandidate of openRouterModels) {
+            try {
+                cerebrasAlreadyTried = true;
+                const completion = await withLlmTimeout(
+                    `OpenRouter ${label} ${openRouterCandidate}`,
+                    openRouterClient.chat.completions.create({
+                        model: openRouterCandidate,
+                        messages,
+                        temperature: defaultTemp,
+                        ...(withJsonMode ? { response_format: { type: 'json_object' } } : {}),
+                        ...(maxTokens ? { max_tokens: maxTokens } : {}),
+                    }),
+                    OPENROUTER_ATTEMPT_TIMEOUT_MS,
+                );
+                const u = completion.usage;
+                const actualModel = completion.model || openRouterCandidate;
+                if (u) emitUsage({ provider: 'openrouter', model: actualModel, label, inputTokens: u.prompt_tokens, outputTokens: u.completion_tokens, totalTokens: u.total_tokens });
+                return extractText(completion.choices[0]?.message?.content).trim();
+            } catch (error) {
+                lastError = error;
+                console.warn(`[MythosEngine] OpenRouter ${openRouterCandidate} failed — trying next fast fallback.`, error instanceof Error ? error.message : error);
+            }
+        }
+        throw lastError instanceof Error ? lastError : new Error(`[MythosEngine] OpenRouter failed for ${label}.`);
     };
 
-    if (provider === 'openrouter') {
-        return executeOpenRouter(json, model !== DEFAULT_MODEL ? model : OPENROUTER_DEFAULT_MODEL);
-    }
 
     // ── Direct Cerebras routing (bypass Groq/Gemini entirely) ─────────────────
     if (provider === 'cerebras') {
@@ -645,13 +1566,13 @@ const chat = async ({
             const cerebrasModel = model !== DEFAULT_MODEL ? model : CEREBRAS_DEFAULT_MODEL;
             const isGptOss = CEREBRAS_GPT_OSS_MODELS.has(cerebrasModel);
             try {
-                const completion = await cerebrasClient.chat.completions.create({
+                const completion = await withLlmTimeout(`Cerebras direct · ${label}`, cerebrasClient.chat.completions.create({
                     model: cerebrasModel,
                     messages,
                     temperature: defaultTemp,
                     ...(json ? { response_format: { type: 'json_object' } } : {}),
                     ...(maxTokens ? (isGptOss ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }) : {}),
-                });
+                }));
                 const u = completion.usage;
                 if (u) emitUsage({ provider: 'cerebras', model: cerebrasModel, label, inputTokens: u.prompt_tokens, outputTokens: u.completion_tokens, totalTokens: u.total_tokens });
                 return extractText(completion.choices[0]?.message?.content).trim();
@@ -667,13 +1588,13 @@ const chat = async ({
         if (geminiClient) {
             for (const geminiModel of [GEMINI_DEFAULT_MODEL, GEMINI_FALLBACK_MODEL]) {
                 try {
-                    const completion = await geminiClient.chat.completions.create({
+                    const completion = await withLlmTimeout(`Gemini direct · ${label}`, geminiClient.chat.completions.create({
                         model: geminiModel,
                         messages,
                         temperature: defaultTemp,
                         ...(json ? { response_format: { type: 'json_object' } } : {}),
                         ...(maxTokens ? { max_tokens: maxTokens } : {}),
-                    });
+                    }));
                     const u = completion.usage;
                     if (u) emitUsage({ provider: 'gemini', model: geminiModel, label, inputTokens: u.prompt_tokens, outputTokens: u.completion_tokens, totalTokens: u.total_tokens });
                     return extractText(completion.choices[0]?.message?.content).trim();
@@ -689,7 +1610,21 @@ const chat = async ({
         try {
             return await executeOpenRouter(json);
         } catch (error) {
-            console.warn('[MythosEngine] OpenRouter preferred provider failed â€” falling back.', error);
+            console.warn('[MythosEngine] OpenRouter preferred provider failed ? falling back.', error);
+            if (keys?.cerebras.trim()) {
+                try {
+                    return await executeCerebras(json);
+                } catch (cerebrasError) {
+                    console.warn('[MythosEngine] Cerebras fallback after OpenRouter failed ? continuing.', cerebrasError);
+                }
+            }
+            if (keys?.gemini.trim()) {
+                try {
+                    return await executeGemini(json);
+                } catch (geminiError) {
+                    console.warn('[MythosEngine] Gemini fallback after OpenRouter failed ? continuing.', geminiError);
+                }
+            }
         }
     }
 
@@ -711,13 +1646,13 @@ const chat = async ({
 
     const execute = async (activeModel: string, withJsonMode: boolean) => {
         if (!client) throw new Error('GROQ_API_KEY not configured.');
-        const completion = await client.chat.completions.create({
+        const completion = await withLlmTimeout(`Groq · ${label}`, client.chat.completions.create({
             model: activeModel,
             messages,
             temperature: defaultTemp,
             ...(withJsonMode ? { response_format: { type: 'json_object' } } : {}),
             ...(maxTokens ? { max_tokens: maxTokens } : {}),
-        });
+        }));
         const u = completion.usage;
         if (u) emitUsage({
             provider: 'groq',
@@ -736,28 +1671,28 @@ const chat = async ({
         if (!geminiClient) throw new Error('GEMINI_API_KEY not configured — cannot use Gemini fallback.');
         const geminiModel = modelOverride ?? GEMINI_DEFAULT_MODEL;
         try {
-            const completion = await geminiClient.chat.completions.create({
+            const completion = await withLlmTimeout(`Gemini · ${label}`, geminiClient.chat.completions.create({
                 model: geminiModel,
                 messages,
                 temperature: defaultTemp,
                 ...(withJsonMode ? { response_format: { type: 'json_object' } } : {}),
                 ...(maxTokens ? { max_tokens: maxTokens } : {}),
-            });
+            }));
             const u = completion.usage;
             if (u) emitUsage({ provider: 'gemini', model: geminiModel, label, inputTokens: u.prompt_tokens, outputTokens: u.completion_tokens, totalTokens: u.total_tokens });
             return extractText(completion.choices[0]?.message?.content).trim();
-        } catch (err) {
+            } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err);
             // If JSON mode caused the error, retry without it (Gemini may not support it on all endpoints)
             if (withJsonMode && (isRetryableModelError(err) || /response_format|json/i.test(errMsg))) {
                 console.warn(`[MythosEngine] Gemini ${geminiModel} JSON mode failed — retrying without.`, errMsg);
                 try {
-                    const noJsonCompletion = await geminiClient.chat.completions.create({
+                    const noJsonCompletion = await withLlmTimeout(`Gemini no-json · ${label}`, geminiClient.chat.completions.create({
                         model: geminiModel,
                         messages,
                         temperature: defaultTemp,
                         ...(maxTokens ? { max_tokens: maxTokens } : {}),
-                    });
+                    }));
                     const u = noJsonCompletion.usage;
                     if (u) emitUsage({ provider: 'gemini', model: geminiModel, label, inputTokens: u.prompt_tokens, outputTokens: u.completion_tokens, totalTokens: u.total_tokens });
                     return extractText(noJsonCompletion.choices[0]?.message?.content).trim();
@@ -768,7 +1703,7 @@ const chat = async ({
                 return executeGemini(withJsonMode, GEMINI_FALLBACK_MODEL);
             }
             console.error(`[MythosEngine] All Gemini models failed.`, errMsg);
-            throw err;
+
         }
     };
 
@@ -776,17 +1711,25 @@ const chat = async ({
     const executeCerebras = async (withJsonMode: boolean, modelOverride?: string): Promise<string> => {
         const cerebrasClient = getCerebrasClient();
         if (!cerebrasClient) throw new Error('CEREBRAS_API_KEY not configured — cannot use Cerebras fallback.');
-        const cerebrasModel = modelOverride ?? CEREBRAS_DEFAULT_MODEL;
-        const isGptOss = CEREBRAS_GPT_OSS_MODELS.has(cerebrasModel);
-        const cerebrasCall = async (useJsonMode: boolean) => {
-            const completion = await cerebrasClient.chat.completions.create({
+        const cerebrasModels = Array.from(new Set([
+            modelOverride,
+            CEREBRAS_DEFAULT_MODEL,
+            CEREBRAS_WEAVER_MODEL,
+            CEREBRAS_LAST_RESORT,
+        ].filter(Boolean) as string[]));
+        let lastError: unknown = null;
+        /*
+        for (const cerebrasModel of cerebrasModels) {
+            const isGptOss = CEREBRAS_GPT_OSS_MODELS.has(cerebrasModel);
+            const cerebrasCall = async (useJsonMode: boolean) => {
+            const completion = await withLlmTimeout(`Cerebras · ${label}`, cerebrasClient.chat.completions.create({
                 model: cerebrasModel,
                 messages,
                 temperature: defaultTemp,
                 ...(useJsonMode ? { response_format: { type: 'json_object' } } : {}),
                 // gpt-oss uses max_completion_tokens; llama models use max_tokens
                 ...(maxTokens ? (isGptOss ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }) : {}),
-            });
+            }));
             const u = completion.usage;
             if (u) emitUsage({ provider: 'cerebras', model: cerebrasModel, label, inputTokens: u.prompt_tokens, outputTokens: u.completion_tokens, totalTokens: u.total_tokens });
             return extractText(completion.choices[0]?.message?.content).trim();
@@ -794,39 +1737,76 @@ const chat = async ({
         try {
             return await cerebrasCall(withJsonMode);
         } catch (err) {
-            // If json_mode caused the failure, retry without it (Cerebras has limited json_mode support)
+                lastError = err;
+                // If json_mode caused the failure, retry without it (Cerebras has limited json_mode support)
             if (withJsonMode) {
                 try {
                     console.warn(`[MythosEngine] Cerebras ${cerebrasModel} json_mode failed — retrying without.`, err instanceof Error ? err.message : err);
                     return await cerebrasCall(false);
-                } catch { /* fall through to model retry */ }
+                    } catch (noJsonErr) {
+                        lastError = noJsonErr;
+                    }
             }
-            if (cerebrasModel !== CEREBRAS_LAST_RESORT) {
+            console.warn(`[MythosEngine] Cerebras ${cerebrasModel} failed â€” trying next model.`, err instanceof Error ? err.message : err);
                 console.warn(`[MythosEngine] Cerebras ${cerebrasModel} failed — retrying with ${CEREBRAS_LAST_RESORT}.`, err instanceof Error ? err.message : err);
-                return executeCerebras(withJsonMode, CEREBRAS_LAST_RESORT);
+
             }
             throw err;
         }
     };
+        */
+
+        for (const cerebrasModel of cerebrasModels) {
+            const isGptOss = CEREBRAS_GPT_OSS_MODELS.has(cerebrasModel);
+            const cerebrasCall = async (useJsonMode: boolean) => {
+                const completion = await withLlmTimeout(`Cerebras Â· ${label}`, cerebrasClient.chat.completions.create({
+                    model: cerebrasModel,
+                    messages,
+                    temperature: defaultTemp,
+                    ...(useJsonMode ? { response_format: { type: 'json_object' } } : {}),
+                    ...(maxTokens ? (isGptOss ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }) : {}),
+                }));
+                const u = completion.usage;
+                if (u) emitUsage({ provider: 'cerebras', model: cerebrasModel, label, inputTokens: u.prompt_tokens, outputTokens: u.completion_tokens, totalTokens: u.total_tokens });
+                return extractText(completion.choices[0]?.message?.content).trim();
+            };
+
+            try {
+                return await cerebrasCall(withJsonMode);
+            } catch (err) {
+                lastError = err;
+                if (withJsonMode) {
+                    try {
+                        console.warn(`[MythosEngine] Cerebras ${cerebrasModel} json_mode failed â€” retrying without.`, err instanceof Error ? err.message : err);
+                        return await cerebrasCall(false);
+                    } catch (noJsonErr) {
+                        lastError = noJsonErr;
+                    }
+                }
+
+                console.warn(`[MythosEngine] Cerebras ${cerebrasModel} failed â€” trying next model.`, err instanceof Error ? err.message : err);
+            }
+        }
+
+        throw lastError instanceof Error ? lastError : new Error(`[MythosEngine] All Cerebras models failed for ${label}.`);
+    };
 
     // ── Full fallback chain: Gemini 2.5 → Gemini 2.0 → Cerebras qwen-3-235b → llama3.1-8b ──
     const tryFallbackProviders = async (reason: string): Promise<string> => {
+        console.warn(`[MythosEngine] ${reason} ? chain: Cerebras -> Groq -> OpenRouter -> Gemini`);
+        try {
+            return await executeCerebras(json);
+        } catch (cerebrasError) {
+            console.warn('[MythosEngine] All Cerebras models failed ? trying OpenRouter, then Gemini.', cerebrasError);
+        }
         if (keys?.openrouter.trim()) {
             try {
                 return await executeOpenRouter(json);
-            } catch {
-                console.warn(`[MythosEngine] OpenRouter ${OPENROUTER_DEFAULT_MODEL} failed â€” trying Gemini.`);
+            } catch (openRouterError) {
+                console.warn('[MythosEngine] OpenRouter fallback failed ? trying Gemini.', openRouterError);
             }
         }
-        console.warn(`[MythosEngine] ${reason} — chain: Gemini 2.5 → Gemini 2.0 → Cerebras ${CEREBRAS_DEFAULT_MODEL} → ${CEREBRAS_LAST_RESORT}`);
-        // Step 1: Gemini 2.5 (executeGemini already retries with 2.0 internally)
-        try {
-            return await executeGemini(json);
-        } catch (geminiError) {
-            console.warn(`[MythosEngine] All Gemini models failed — trying Cerebras ${CEREBRAS_DEFAULT_MODEL}.`);
-        }
-        // Step 2: Cerebras primary → llama3.1-8b (executeCerebras retries internally)
-        return executeCerebras(json);
+        return executeGemini(json);
     };
 
     if (!client) {
@@ -864,10 +1844,78 @@ const ZDirectorGuidance = z.object({
     narrativePressure:      z.string().min(1),
     wordsToSetOnCooldown:   z.array(z.string()).default([]),
     cooldownSubstitutions:  z.array(z.object({ term: z.string(), note: z.string() })).default([]),
+    rhetoricalBans:         z.array(z.string()).default([]),
+    imageryCooldown:        z.array(z.string()).default([]),
+    openingConstraint:      z.string().default(''),
+    closingConstraint:      z.string().default(''),
+    densityTarget:          z.enum(['lean', 'balanced', 'lush']).default('balanced'),
     contradictionSummary:   z.string().default(''),
     liePressureSource:      z.string().default(''),
     protagonistLieStability:z.number().min(1).max(10).default(10),
     ruptureRequired:        z.boolean().default(false),
+});
+
+const ZLongformBlueprint = z.object({
+    title: z.string().min(1),
+    logline: z.string().min(1),
+    promise: z.string().min(1),
+    conflictCore: z.string().min(1),
+    protagonistFocus: z.string().min(1),
+    targetChapters: z.number().int().min(15).max(20),
+    minChapters: z.number().int().min(15).max(20),
+    maxChapters: z.number().int().min(15).max(20),
+    acts: z.array(z.object({
+        actIndex: z.number().int().min(1).max(4),
+        label: z.string().min(1),
+        purpose: z.string().min(1),
+        chapterStart: z.number().int().min(1),
+        chapterEnd: z.number().int().min(1),
+        milestone: z.string().min(1),
+    })).length(4),
+    milestones: z.array(z.object({
+        chapter: z.number().int().min(1),
+        label: z.string().min(1),
+        objective: z.string().min(1),
+    })).min(4),
+    chapterMap: z.array(z.object({
+        chapterNumber: z.number().int().min(1),
+        actIndex: z.number().int().min(1).max(4),
+        function: z.enum(['setup', 'inciting_break', 'lock_in', 'complication', 'reversal', 'midpoint', 'descent', 'collapse', 'pre_climax', 'climax', 'aftermath']),
+        goal: z.string().min(1),
+        milestone: z.string().optional(),
+    })).min(15).max(20),
+});
+
+const ZLongformBlueprintCore = z.object({
+    title: z.string().min(1),
+    logline: z.string().min(1),
+    promise: z.string().min(1),
+    conflictCore: z.string().min(1),
+    protagonistFocus: z.string().min(1),
+});
+
+const ZLongformBlueprintActsPass = z.object({
+    acts: z.array(z.object({
+        actIndex: z.number().int().min(1).max(4),
+        label: z.string().min(1),
+        purpose: z.string().min(1),
+        milestone: z.string().min(1),
+    })).length(4),
+    milestones: z.array(z.object({
+        chapter: z.number().int().min(1),
+        label: z.string().min(1),
+        objective: z.string().min(1),
+    })).length(4),
+});
+
+const ZLongformBlueprintChapterPass = z.object({
+    chapters: z.array(z.object({
+        chapterNumber: z.number().int().min(1),
+        actIndex: z.number().int().min(1).max(4),
+        function: z.enum(['setup', 'inciting_break', 'lock_in', 'complication', 'reversal', 'midpoint', 'descent', 'collapse', 'pre_climax', 'climax', 'aftermath']),
+        goal: z.string().min(1),
+        milestone: z.string().optional(),
+    })),
 });
 
 const ZWeaverPlan = z.object({
@@ -891,6 +1939,10 @@ const ZSurgicalLectorOutput = z.object({
     sceneObjectiveCheck:  z.enum(['ok', 'complicado', 'falhou']).default('ok'),
     rhetoricalPatternOveruse: z.string().default(''),
     rhetoricalPatternCount: z.number().int().min(0).default(0),
+    imageryOveruse: z.array(z.string()).default([]),
+    openingSimilarityToRecentChapters: z.enum(['low', 'medium', 'high']).default('low'),
+    endingSimilarityToRecentChapters: z.enum(['low', 'medium', 'high']).default('low'),
+    mustRewrite: z.boolean().default(false),
 });
 
 const ZChroniclerOutput = z.object({
@@ -917,6 +1969,10 @@ const ZChroniclerOutput = z.object({
         passiveProtagonist:   z.string().optional(),
         rhetoricalPatternOveruse: z.string().optional(),
         rhetoricalPatternCount: z.number().optional(),
+        imageryOveruse: z.array(z.string()).optional(),
+        openingSimilarityToRecentChapters: z.enum(['low', 'medium', 'high']).optional(),
+        endingSimilarityToRecentChapters: z.enum(['low', 'medium', 'high']).optional(),
+        mustRewrite: z.boolean().optional(),
     }).optional(),
 });
 
@@ -940,28 +1996,54 @@ const chatJson = async <T>({
     temperature?: number;
     maxTokens?: number;
     label?: string;
-    provider?: 'groq' | 'gemini' | 'cerebras' | 'auto';
+    provider?: 'groq' | 'gemini' | 'cerebras' | 'openrouter' | 'auto';
     schema?: z.ZodType<T>;
 }): Promise<T> => {
+    let raw = '';
     try {
-        const raw = await chat({ system, user, json: true, model, temperature, maxTokens, label, provider });
+        raw = await chat({ system, user, json: true, model, temperature, maxTokens, label, provider });
         if (!raw) return fallback;
-        const parsed = safeJsonParse<T>(raw);
+        let parsed: T;
+        try {
+            parsed = deepRepairTextArtifacts(safeJsonParse<T>(raw));
+        } catch (parseError) {
+            if (shouldAttemptBlueprintTranslationPass(label)) {
+                const translated = await translateRawBlueprintJson({ raw, fallback, schema, label });
+                if (translated) return deepRepairTextArtifacts(translated);
+            }
+            throw parseError;
+        }
         if (schema) {
             const result = schema.safeParse(parsed);
             if (!result.success) {
                 console.warn(`[Zod] ${label ?? 'chatJson'} schema mismatch:`, result.error.format());
                 // Attempt coercion with safe defaults rather than discarding entirely
-                const coerced = schema.safeParse({ ...fallback as object, ...parsed as object });
-                return coerced.success ? coerced.data : fallback;
+                const coerced = schema.safeParse(deepRepairTextArtifacts({ ...fallback as object, ...parsed as object }));
+                return coerced.success ? deepRepairTextArtifacts(coerced.data) : deepRepairTextArtifacts(fallback);
             }
-            return result.data;
+            return deepRepairTextArtifacts(result.data);
         }
-        return parsed;
+        return deepRepairTextArtifacts(parsed);
     } catch (error) {
         const errMsg = error instanceof Error ? error.message : String(error);
         console.warn('LLM JSON call failed', error);
         if (label) {
+            const usedMeaningfulFallback = hasMeaningfulFallback(fallback);
+            const isParseIssue = /JSON parse failed/i.test(errMsg);
+            const debugDetail = isParseIssue && raw
+                ? `${errMsg}\n\n${summarizeRawModelOutput(raw)}`
+                : errMsg;
+            const fallbackSummary = usedMeaningfulFallback
+                ? (isParseIssue ? 'Modelo respondeu, mas o JSON veio inválido — usando fallback local' : 'Modelo falhou — usando fallback local')
+                : 'Todos os provedores falharam â€” usando fallback vazio';
+            emitAgentOutput({
+                agent: 'system',
+                label: `âš  ${label}`,
+                status: 'done',
+                summary: fallbackSummary,
+                detail: debugDetail,
+            });
+            return deepRepairTextArtifacts(fallback);
             emitAgentOutput({
                 agent: 'system',
                 label: `⚠ ${label}`,
@@ -970,7 +2052,7 @@ const chatJson = async <T>({
                 detail: errMsg,
             });
         }
-        return fallback;
+        return deepRepairTextArtifacts(fallback);
     }
 };
 
@@ -1099,6 +2181,37 @@ const buildUniverseContext = (
     --- TIMELINE ---
     ${timeline.map(t => `- ${t.title}${formatAliasesInline(t.aliases)} [${t.eventState ?? 'historical'}${t.discoveryKind ? ` / ${t.discoveryKind}` : ''}${t.timelineImpact ? ` / impact:${t.timelineImpact}` : ''}${t.timelineScope ? ` / scope:${t.timelineScope}` : ''}]: ${truncateText(t.content, compact ? 120 : 240)}`).join('\n') || '- None recorded.'}
     `;
+};
+
+const buildLongformBlueprintContext = (
+    universe: Universe,
+    protagonist: Character | undefined,
+    compact = false,
+): string => {
+    const factions = collectEffectiveCodexEntries(universe.codex.factions, true, compact ? 2 : 3);
+    const rules = collectEffectiveCodexEntries(universe.codex.rules, true, compact ? 3 : 4);
+    const timeline = collectEffectiveTimelineEntries(universe.codex.timeline, true, compact ? 2 : 3, protagonist ? [protagonist.id] : []);
+
+    return [
+        `UNIVERSE: ${universe.name}`,
+        `PREMISE: ${truncateText(universe.description || universe.codex.overview, compact ? 180 : 260)}`,
+        `WORLD: ${truncateText(universe.codex.overview || universe.description, compact ? 220 : 320)}`,
+        `PROTAGONIST: ${protagonist?.name || 'Unknown'} - ${truncateText(protagonist?.bio || '', compact ? 140 : 220) || 'No bio'}`,
+        `GHOST: ${truncateText(protagonist?.ghost || 'none', compact ? 100 : 160)}`,
+        `LIE: ${truncateText(protagonist?.coreLie || 'none', compact ? 100 : 160)}`,
+        'FACTIONS:',
+        ...(factions.length > 0
+            ? factions.map(entry => `- ${entry.title}: ${truncateText(entry.content, compact ? 70 : 100)}`)
+            : ['- none']),
+        'RULES:',
+        ...(rules.length > 0
+            ? rules.map(entry => `- ${entry.title}: ${truncateText(entry.content, compact ? 70 : 100)}`)
+            : ['- none']),
+        'TIMELINE:',
+        ...(timeline.length > 0
+            ? timeline.map(entry => `- ${entry.title}: ${truncateText(entry.content, compact ? 70 : 100)}`)
+            : ['- none']),
+    ].join('\n');
 };
 
 // Compact list for Weaver: name + role + current state/location (no bio)
@@ -1303,6 +2416,13 @@ const buildBardMemoryHints = (universe: Universe, chapterIndex?: number, compact
         hints.push(`LEXICAL SUBSTITUTION RULES:\n${substitutionRules.join('\n')}`);
     }
 
+    const activePatternBans = Object.entries(mem.stylePatternCooldown ?? {})
+        .filter(([, expiry]) => expiry > currentChIdx)
+        .map(([pattern]) => pattern);
+    if (activePatternBans.length) {
+        hints.push(`STYLE PATTERN COOLDOWN:\n${activePatternBans.map(pattern => `- ${STYLE_PATTERN_LABELS[pattern] || pattern}`).join('\n')}`);
+    }
+
     // Passive protagonist escalation
     if (mem.lastAuditFlags?.passiveProtagonist === 'sim') {
         hints.push('⚠️ PASSIVE PROTAGONIST flagged — protagonist was passive last chapter. Every beat in this chapter: protagonist must initiate an action (move, grab, decide, fight, escape, confront). Zero passive observation allowed.');
@@ -1314,6 +2434,22 @@ const buildBardMemoryHints = (universe: Universe, chapterIndex?: number, compact
     if (mem.lastAuditFlags?.rhetoricalPatternCount && mem.lastAuditFlags.rhetoricalPatternCount >= 3) {
         hints.push('FORM RESTRICTION: maximum one contrastive-negation construction in the whole chapter, preferably zero. Rewrite sentences into direct image, direct action, or direct consequence instead of sentence-internal correction.');
     }
+    if (mem.lastAuditFlags?.imageryOveruse?.length) {
+        hints.push(`IMAGERY COOLDOWN: avoid centering the chapter around these image families again: ${mem.lastAuditFlags.imageryOveruse.join(', ')}.`);
+    }
+    if (mem.lastAuditFlags?.openingSimilarityToRecentChapters === 'high') {
+        hints.push('OPENING REPEAT WARNING: recent chapter openings sound too similar. Open this chapter with a different mechanism: action, dialogue, interruption, objective task, or blunt consequence.');
+    }
+    if (mem.lastAuditFlags?.endingSimilarityToRecentChapters === 'high') {
+        hints.push('ENDING REPEAT WARNING: recent chapter endings are too similar. Do NOT close on a rhetorical identity question again.');
+    }
+
+    const dir = mem.directorGuidance;
+    if (dir?.openingConstraint) hints.push(`DIRECTOR OPENING CONSTRAINT: ${dir.openingConstraint}`);
+    if (dir?.closingConstraint) hints.push(`DIRECTOR CLOSING CONSTRAINT: ${dir.closingConstraint}`);
+    if (dir?.rhetoricalBans?.length) hints.push(`DIRECTOR RHETORICAL BANS: ${dir.rhetoricalBans.join(', ')}`);
+    if (dir?.imageryCooldown?.length) hints.push(`DIRECTOR IMAGERY COOLDOWN: ${dir.imageryCooldown.join(', ')}`);
+    if (dir?.densityTarget) hints.push(`DIRECTOR DENSITY TARGET: ${dir.densityTarget}`);
 
     const protagonist = universe.characters[0];
     const lieState = protagonist
@@ -1345,8 +2481,13 @@ const OPENING_STYLES: { style: OpeningStyle; instruction: string }[] = [
     { style: 'epistolary', instruction: 'Open with a letter, diary entry, news broadcast, or in-world document fragment.' },
 ];
 
-const pickOpeningStyle = (): { style: OpeningStyle; instruction: string } => {
-    return OPENING_STYLES[Math.floor(Math.random() * OPENING_STYLES.length)];
+const pickOpeningStyle = (universe?: Universe): { style: OpeningStyle; instruction: string } => {
+    const recent = universe?.chapters.slice(-2).map(ch => ch.openingStyle).filter(Boolean) as OpeningStyle[] | undefined;
+    const blocked = new Set(recent ?? []);
+    const preferred = OPENING_STYLES.filter(item => !blocked.has(item.style) && item.style !== 'description');
+    const pool = preferred.length > 0 ? preferred : OPENING_STYLES.filter(item => !blocked.has(item.style));
+    const finalPool = pool.length > 0 ? pool : OPENING_STYLES;
+    return finalPool[Math.floor(Math.random() * finalPool.length)];
 };
 
 // ─── Prose cleanup helpers ──────────────────────────────────────────────────
@@ -2079,6 +3220,10 @@ interface ChroniclerOutput {
         passiveProtagonist?: string;
         rhetoricalPatternOveruse?: string;
         rhetoricalPatternCount?: number;
+        imageryOveruse?: string[];
+        openingSimilarityToRecentChapters?: 'low' | 'medium' | 'high';
+        endingSimilarityToRecentChapters?: 'low' | 'medium' | 'high';
+        mustRewrite?: boolean;
     };
 }
 
@@ -2151,6 +3296,10 @@ interface SurgicalLectorOutput {
     sceneObjectiveCheck: 'ok' | 'complicado' | 'falhou';
     rhetoricalPatternOveruse?: string;
     rhetoricalPatternCount?: number;
+    imageryOveruse?: string[];
+    openingSimilarityToRecentChapters?: 'low' | 'medium' | 'high';
+    endingSimilarityToRecentChapters?: 'low' | 'medium' | 'high';
+    mustRewrite?: boolean;
 }
 
 const generateChapterThreePass = async (
@@ -2204,6 +3353,14 @@ const generateChapterThreePass = async (
             : `DENSITY MODE: CHAPTER (default).
 - You MUST plan EXACTLY 5 to 7 scenes. Never fewer than 5. This is non-negotiable.
 - If you return fewer than 5 scenes, your output is invalid and will be rejected.`;
+        const longformWeaverMeta = params.longformMode
+            ? `
+LONGFORM STRUCTURE:
+- This chapter belongs to ACT ${params.actIndex ?? '?'} of a longform work.
+- Structural function: ${params.chapterFunction ?? 'complication'}
+- Milestone pressure: ${params.milestoneFocus || 'advance the work toward its next irreversible turn'}
+- By the end of the chapter, something must clearly change in the protagonist, conflict, or world state.`
+            : '';
 
     plan = await chatJson<{
         chapterTitle?: string;
@@ -2216,6 +3373,7 @@ const generateChapterThreePass = async (
 ${weaverLangLine}
 
 You are planning the structure of a single chapter.
+${longformWeaverMeta}
 CRITICAL CONTINUITY RULES:
 - The chapter MUST directly continue from where the previous chapter ended.
 - If there is a cliffhanger or open plot thread, it MUST be addressed or actively developed.
@@ -2279,7 +3437,7 @@ Loop Priority: ${dir.loopPriority}
         temperature: 0.5,
         label: 'Weaver · Planner',
         maxTokens: compactMode ? 1800 : 2000,
-        provider: 'cerebras',
+        provider: getPreferredHighCapabilityProvider(),
     });
 
         // Sanitize chapter title — strip garbled Unicode control chars
@@ -2334,7 +3492,7 @@ Loop Priority: ${dir.loopPriority}
     // ── Pass 2: Bard (writer) — temp 0.88, FREE prose (no JSON) ──
     emitAgentOutput({ agent: 'bard', label: 'Bard · Escrita', status: 'thinking' });
     const bardPrompt = getAgentPrompt(universe, 'bard', compactMode);
-    const opening = pickOpeningStyle();
+    const opening = pickOpeningStyle(universe);
 
     const scenesPlan = plan.scenes && plan.scenes.length > 0
         ? plan.scenes.map((s, i) => `B${i + 1}[${s.tension[0]}]: ${s.beat} · ${s.characters.join('/')}`).join('\n')
@@ -2365,11 +3523,10 @@ Write a single flowing arc passage (180–350 words). Rules:
             system: bardPrompt,
             user: arcUser,
             json: false,
-            model: BARD_CEREBRAS_MODEL,
             temperature: 0.8,
             maxTokens: compactMode ? 900 : 1400,
             label: 'Bard · Arc',
-            provider: 'cerebras',
+            provider: getPreferredHighCapabilityProvider(),
         });
         arcModeProse = stripLLMPrefixes(arcModeProse);
         arcModeProse = cleanLanguageLeakage(arcModeProse, params.lang ?? universe.lang ?? 'pt');
@@ -2440,6 +3597,27 @@ ${knownLocations ? `- ESTABLISHED LOCATIONS (familiar — describe from fresh an
     const bardPassiveNote = lastAuditPassive === 'sim'
         ? `\n=== ACTIVE PROTAGONIST MANDATE ===\n- POV ANCHOR: "${protagonistName}" is the grammatical subject of every action. Other characters act — but ${protagonistName} RESPONDS with a physical action.\n- FORBIDDEN: paragraphs where ${protagonistName} only watches, follows, or waits without acting.\n- Every paragraph must end with ${protagonistName} having done something or decided something.\n`
         : '';
+    const recentStarts = getRecentChapterStarts(universe);
+    const recentEndings = getRecentChapterEndings(universe);
+    const directorStyle = universe.narrativeMemory?.directorGuidance;
+    const densityInstruction = directorStyle?.densityTarget === 'lean'
+        ? 'PROSE DENSITY TARGET: LEAN. Cut ornament aggressively. Favor direct physical progression, cleaner syntax, and fewer metaphoric layers.'
+        : directorStyle?.densityTarget === 'lush'
+        ? 'PROSE DENSITY TARGET: LUSH. Rich texture is allowed, but vary sentence shape and avoid repeating the same rhetoric or image family.'
+        : 'PROSE DENSITY TARGET: BALANCED. Alternate clean forward motion with selected moments of richer language.';
+    const directorStyleMandate = `
+=== STYLE VARIATION MANDATE ===
+- This chapter must sound different from the previous two in opening shape, dominant image family, and ending mechanism.
+- Recent opening lines to avoid echoing:
+${recentStarts.length ? recentStarts.map(line => `  • ${truncateText(line, 140)}`).join('\n') : '  • none'}
+- Recent ending lines to avoid echoing:
+${recentEndings.length ? recentEndings.map(line => `  • ${truncateText(line, 140)}`).join('\n') : '  • none'}
+- ${directorStyle?.openingConstraint || 'Do not default to a dense sensory opening.'}
+- ${directorStyle?.closingConstraint || 'Do not default to a rhetorical identity question at the end.'}
+- Rhetorical bans: ${(directorStyle?.rhetoricalBans?.join(', ')) || 'avoid corrective negation and abstract sentence self-correction'}
+- Imagery on cooldown: ${(directorStyle?.imageryCooldown?.join(', ')) || 'none'}
+- ${densityInstruction}
+`;
 
     const bardInput = `
 ${langMandateText}
@@ -2448,7 +3626,14 @@ ${worldContext}
 ${characterContext}
 ${buildBardMemoryHints(universe, params.chapterIndex, compactMode)}
 ${stagnationWarning}${bardPassiveNote}
-=== CHAPTER PLAN (from the Weaver — follow this structure) ===
+${params.longformMode ? `=== LONGFORM STRUCTURE ===
+This is chapter ${(params.chapterIndex ?? universe.chapters.length) + 1} of ${params.targetChapterCount ?? universe.longformBlueprint?.targetChapters ?? 18}.
+Act: ${params.actIndex ?? universe.longformProgress?.currentAct ?? '?'}
+Chapter function: ${params.chapterFunction ?? universe.longformProgress?.currentFunction ?? 'complication'}
+Required change by the end: ${params.milestoneFocus || 'advance the work toward its next irreversible turn'}
+The chapter must feel like a structural step inside a larger novel, not an isolated episode.
+` : ''}
+=== CHAPTER PLAN (from the Weaver - follow this structure) ===
 Title: ${plan.chapterTitle || params.title}
 Narrative beats to cover (in order):
 ${scenesPlan}
@@ -2461,6 +3646,7 @@ ${povInstruction}
 
 ${groundingMandate}
 ${nameVariationMandate}
+${directorStyleMandate}
 
 === CONTINUITY — FORBIDDEN REPEATS ===
 - Do NOT reuse any sensory prop or imagery from the PREVIOUS chapter. If luminescent fish, a wall, a smell, or a texture appeared last time — find something else.
@@ -2570,11 +3756,10 @@ STYLE: ${params.tone}. FOCUS: ${params.focus}.
         system: bardPrompt,
         user: bardInput,
         json: false,
-        model: BARD_CEREBRAS_MODEL,
         temperature: 0.88,
         maxTokens: compactMode ? 4400 : 5200,
         label: 'Bard · Escrita',
-        provider: 'cerebras',
+        provider: getPreferredHighCapabilityProvider(),
     });
 
     prose = stripLLMPrefixes(prose);
@@ -2589,11 +3774,10 @@ STYLE: ${params.tone}. FOCUS: ${params.focus}.
 
 CRITICAL REVISION TASK: Expand the chapter below so it fully dramatizes every planned beat. Keep the same events, but add missing environment, physical action, transitions, and consequences until the text reaches at least ${targetMinChars} characters. Return the FULL rewritten chapter, not just the added part.\n\nCURRENT CHAPTER:\n${prose}`,
             json: false,
-            model: BARD_CEREBRAS_MODEL,
             temperature: 0.82,
             maxTokens: compactMode ? 4400 : 5200,
             label: compactMode ? 'Bard · Retry' : 'Bard · Expand',
-            provider: 'cerebras',
+            provider: getPreferredHighCapabilityProvider(),
         });
         expansionProse = stripLLMPrefixes(expansionProse);
         expansionProse = cleanLanguageLeakage(expansionProse, params.lang ?? universe.lang ?? 'pt');
@@ -2647,6 +3831,8 @@ CRITICAL REVISION TASK: Expand the chapter below so it fully dramatizes every pl
 
     // Feed up to 6000 chars — covers most chapters without ballooning Lector cost
     const proseSample = prose.length > 6000 ? prose.slice(0, 6000) + '\n[…truncated for audit…]' : prose;
+    const previousOpenings = getRecentChapterStarts(universe, 2);
+    const previousEndings = getRecentChapterEndings(universe, 2);
 
     // Apply surgical replacements to the full prose
     const lectorResult = await chatJson<SurgicalLectorOutput>({
@@ -2655,6 +3841,9 @@ RULES:
 - Return MAX 8 replacements. Each "find" must be an EXACT verbatim phrase from the text (10-60 chars).
 - Only flag issues that are CLEARLY present: word overuse (same non-article word 4+ times), POV drift, passive protagonist.
 - Detect rhetorical crutches: repeated contrastive-negation molds such as "não X, mas Y", "não era..., mas...", "em vez disso", "not X, but Y".
+- Detect repeated opening behavior: dense atmospheric first paragraphs, protagonist-name-plus-motion openings, and openings too similar to recent chapters.
+- Detect repeated ending behavior: rhetorical identity questions and endings too similar to recent chapters.
+- Detect imagery-family saturation: overuse of the same semantic family (bone/stone/metal/humidity/abyss/pulsing).
 - Detect tonal monotony: if too many consecutive sentences sound maximally solemn, aphoristic, or trailer-like, prefer cleaner and more direct replacements.
 - Detect narrative filtering and hedged atmosphere: "ele sentiu", "ele sabia", "ele percebeu", "ele viu", "parecia", "como se", "as if", "seemed".
 - Your replacements must REDUCE inflation, not increase it.
@@ -2671,6 +3860,10 @@ RULES:
 PROTAGONIST: ${protagonistName}
 POV: ${pov === 'primeira_pessoa' ? 'first-person (eu/I)' : pov === 'terceiro_onisciente' ? 'third-person omniscient' : 'third-person limited'}
 PREVIOUSLY OVERUSED WORDS (flag if repeated again): ${prevWordOveruse.join(', ') || 'none'}
+RECENT OPENINGS TO COMPARE AGAINST:
+${previousOpenings.map(line => `- ${truncateText(line, 140)}`).join('\n') || '- none'}
+RECENT ENDINGS TO COMPARE AGAINST:
+${previousEndings.map(line => `- ${truncateText(line, 140)}`).join('\n') || '- none'}
 
 CHAPTER TEXT:
 ${proseSample}
@@ -2684,13 +3877,17 @@ Return ONLY valid JSON matching this exact schema:
   "passiveProtagonist": "sim" | "não",
   "sceneObjectiveCheck": "ok" | "complicado" | "falhou",
   "rhetoricalPatternOveruse": "short warning message if contrastive-negation rhetoric is overused",
-  "rhetoricalPatternCount": 0
+  "rhetoricalPatternCount": 0,
+  "imageryOveruse": ["family1"],
+  "openingSimilarityToRecentChapters": "low" | "medium" | "high",
+  "endingSimilarityToRecentChapters": "low" | "medium" | "high",
+  "mustRewrite": false
 }`,
-        fallback: { replacements: [], wordOveruse: [], passiveProtagonist: 'não', sceneObjectiveCheck: 'ok' },
+        fallback: { replacements: [], wordOveruse: [], passiveProtagonist: 'não', sceneObjectiveCheck: 'ok', imageryOveruse: [], openingSimilarityToRecentChapters: 'low', endingSimilarityToRecentChapters: 'low', mustRewrite: false },
         temperature: 0.2,
         maxTokens: compactMode ? 1400 : 1600,
         label: 'Lector · Cirúrgico',
-        provider: 'cerebras',
+        provider: getPreferredHighCapabilityProvider(),
         schema: ZSurgicalLectorOutput as z.ZodType<SurgicalLectorOutput>,
     });
     lectorAudit = lectorResult;
@@ -2699,35 +3896,55 @@ Return ONLY valid JSON matching this exact schema:
         ...lectorAudit,
         rhetoricalPatternCount: Math.max(lectorAudit.rhetoricalPatternCount ?? 0, rhetoricalAudit.count),
         rhetoricalPatternOveruse: lectorAudit.rhetoricalPatternOveruse || rhetoricalAudit.message || '',
+        imageryOveruse: Array.from(new Set([...(lectorAudit.imageryOveruse ?? []), ...detectImageryOveruse(proseSample)])),
     };
+    const inferredOpeningPattern = inferOpeningPattern(proseSample, protagonistName);
+    const inferredEndingPattern = inferEndingPattern(proseSample);
+    const openingSimilarity = inferredOpeningPattern && previousOpenings.length > 0
+        ? 'high'
+        : (lectorAudit.openingSimilarityToRecentChapters ?? 'low');
+    const endingSimilarity = inferredEndingPattern && previousEndings.length > 0
+        ? 'high'
+        : (lectorAudit.endingSimilarityToRecentChapters ?? 'low');
+    lectorAudit.openingSimilarityToRecentChapters = openingSimilarity;
+    lectorAudit.endingSimilarityToRecentChapters = endingSimilarity;
+    lectorAudit.mustRewrite = Boolean(
+        lectorAudit.mustRewrite
+        || (lectorAudit.rhetoricalPatternCount ?? 0) >= 3
+        || (lectorAudit.imageryOveruse?.length ?? 0) >= 2
+        || openingSimilarity === 'high'
+        || endingSimilarity === 'high'
+    );
 
     // Apply surgical replacements to the full prose
     finalProse = applyLectorReplacements(prose, lectorAudit.replacements ?? []);
     // Safety: if result shrank dramatically, fall back to original
     if (finalProse.length < prose.length * 0.92) finalProse = prose;
-    if ((lectorAudit.rhetoricalPatternCount ?? 0) >= 2 && !compactMode) {
+    if (lectorAudit.mustRewrite && !compactMode) {
         emitAgentOutput({ agent: 'bard', label: 'Bard rhetorical rewrite', status: 'thinking' });
         let rewrittenProse = await chat({
             system: bardPrompt,
             user: `${langMandateText}
 
-The Lector flagged heavy overuse of contrastive-negation rhetoric in the chapter below.
+The Lector flagged stylistic repetition in the chapter below.
 
-=== RHETORICAL REWRITE MANDATE ===
+=== RHETORICAL / STYLE REWRITE MANDATE ===
 - Remove habitual formulas such as "não X, mas Y", "não era..., mas...", "em vez disso", "não com..., mas com...".
+- If the opening repeats recent chapter openings, rewrite the FIRST paragraph with a different mechanism.
+- If the ending closes on a rhetorical identity question, replace it with image, action, revelation, or irreversible choice.
+- Reduce imagery saturation from these families: ${(lectorAudit.imageryOveruse ?? []).join(', ') || 'none'}.
 - Rewrite toward direct statement, direct image, direct action, sensory detail, or consequence.
 - Preserve plot, scene order, character decisions, and ending.
-- Keep the prose dense and literary, but stop self-correcting sentences.
+- Keep the prose literary, but stop self-correcting sentences and avoid repeating the same atmospheric machinery.
 - Return the FULL rewritten chapter.
 
 CHAPTER TO FIX:
 ${finalProse}`,
             json: false,
-            model: BARD_CEREBRAS_MODEL,
             temperature: 0.7,
             maxTokens: 5200,
             label: 'Bard rhetorical rewrite',
-            provider: 'cerebras',
+            provider: getPreferredHighCapabilityProvider(),
         });
         rewrittenProse = stripLLMPrefixes(rewrittenProse);
         rewrittenProse = cleanLanguageLeakage(rewrittenProse, params.lang ?? universe.lang ?? 'pt');
@@ -2741,6 +3958,9 @@ ${finalProse}`,
         lectorAudit.passiveProtagonist === 'sim' ? '⚠ protagonista passivo' : null,
         lectorAudit.sceneObjectiveCheck !== 'ok' ? `cenas: ${lectorAudit.sceneObjectiveCheck}` : null,
         lectorAudit.wordOveruse?.length ? `overuse: ${lectorAudit.wordOveruse.join(', ')}` : null,
+        lectorAudit.imageryOveruse?.length ? `imagética: ${lectorAudit.imageryOveruse.join(', ')}` : null,
+        lectorAudit.openingSimilarityToRecentChapters === 'high' ? 'abertura repetida' : null,
+        lectorAudit.endingSimilarityToRecentChapters === 'high' ? 'fecho repetido' : null,
         lectorAudit.rhetoricalPatternCount && lectorAudit.rhetoricalPatternCount >= 3 ? `retÃ³rica IA: ${lectorAudit.rhetoricalPatternCount}` : null,
     ].filter(Boolean).join(' · ');
 
@@ -2773,11 +3993,10 @@ ${protagonistName} is observing, following or waiting in scenes instead of drivi
 CHAPTER TO FIX:
 ${finalProse}`,
             json: false,
-            model: BARD_CEREBRAS_MODEL,
             temperature: 0.75,
             maxTokens: 5200,
             label: 'Bard · Reescrita Ativa',
-            provider: 'cerebras',
+            provider: getPreferredHighCapabilityProvider(),
         });
         rewrittenProse = stripLLMPrefixes(rewrittenProse);
         rewrittenProse = cleanLanguageLeakage(rewrittenProse, params.lang ?? universe.lang ?? 'pt');
@@ -2792,6 +4011,7 @@ ${finalProse}`,
             summary: `protagonista reativado · ${finalProse.length} chars`,
             detail: finalProse.slice(0, 200) + '…',
         });
+        blueprint = normalizeLongformBlueprint(blueprint, preparedUniverse);
     }
 
     } // end if (!arcModeProse) — Lector + 3b rewrite
@@ -2886,7 +4106,7 @@ For each character update, also note any relationships that are revealed or chan
         temperature: 0.15,
         label: 'Chronicler · Extrator',
         maxTokens: compactMode ? 2400 : 3200,
-        provider: 'cerebras',
+        provider: getPreferredHighCapabilityProvider(),
     });
 
     // Retry if the model echoed the schema type instead of filling it in
@@ -2920,8 +4140,9 @@ For each character update, also note any relationships that are revealed or chan
             temperature: 0.1,
             label: 'Chronicler · Retry',
             maxTokens: compactMode ? 2000 : 2600,
-            provider: 'cerebras',
+            provider: getPreferredHighCapabilityProvider(),
         });
+        blueprint = normalizeLongformBlueprint(blueprint, preparedUniverse);
     }
 
     // ── Shadow Chronicler — Groq plain-text fallback if Cerebras failed twice ──
@@ -2984,6 +4205,10 @@ For each character update, also note any relationships that are revealed or chan
             sceneObjectiveCheck: worseSco,
             rhetoricalPatternOveruse: lectorAudit.rhetoricalPatternOveruse || safeChronicler.auditFlags?.rhetoricalPatternOveruse,
             rhetoricalPatternCount: Math.max(lectorAudit.rhetoricalPatternCount ?? 0, safeChronicler.auditFlags?.rhetoricalPatternCount ?? 0),
+            imageryOveruse: Array.from(new Set([...(lectorAudit.imageryOveruse ?? []), ...(safeChronicler.auditFlags?.imageryOveruse ?? [])])),
+            openingSimilarityToRecentChapters: lectorAudit.openingSimilarityToRecentChapters || safeChronicler.auditFlags?.openingSimilarityToRecentChapters,
+            endingSimilarityToRecentChapters: lectorAudit.endingSimilarityToRecentChapters || safeChronicler.auditFlags?.endingSimilarityToRecentChapters,
+            mustRewrite: lectorAudit.mustRewrite || safeChronicler.auditFlags?.mustRewrite,
         };
     }
 
@@ -3053,12 +4278,26 @@ const generateDirectorGuidance = async (
     const recentEvents = mem?.recentEvents ?? [];
     const factions = universe.codex.factions.map(f => f.title).join(', ') || 'none';
     const activeTimelinePressure = universe.codex.timeline.filter(entry => entry.eventState === 'active_pressure').slice(0, 4);
+    const longformBlueprint = universe.longformBlueprint;
+    const longformProgress = universe.longformProgress;
+    const structuralMeta = longformBlueprint && longformProgress
+        ? `LONGFORM STRUCTURE:
+- Chapter ${longformProgress.currentChapter} of ${longformBlueprint.targetChapters}
+- Act ${longformProgress.currentAct}
+- Expected function: ${longformProgress.currentFunction || 'n/a'}
+- Current milestone: ${longformProgress.currentMilestone || 'n/a'}
+- Completed milestones: ${longformProgress.completedMilestones.join(' | ') || 'none'}`
+        : '';
     // Words already on cooldown — pass them so Director can avoid re-adding them
     const currentChIdx = universe.chapters.length;
     const activeCooldownWords = Object.entries(mem?.lexicalCooldown ?? {})
         .filter(([, expiry]) => expiry > currentChIdx)
         .map(([word]) => word);
+    const activeStylePatterns = Object.entries(mem?.stylePatternCooldown ?? {})
+        .filter(([, expiry]) => expiry > currentChIdx)
+        .map(([pattern]) => pattern);
     const newOveruse = mem?.lastAuditFlags?.wordOveruse ?? [];
+    const imageryOveruse = mem?.lastAuditFlags?.imageryOveruse ?? [];
 
     const fallback: DirectorGuidance = {
         openLoopCount: openLoops.length,
@@ -3080,6 +4319,20 @@ const generateDirectorGuidance = async (
             term: word,
             note: `Do not use "${word}". Replace it with sensory description, metaphor, or consequence.`,
         })),
+        rhetoricalBans: [
+            'nao_x_mas_y',
+            'nao_era_x_era_y',
+            ...(mem?.lastAuditFlags?.openingSimilarityToRecentChapters === 'high' ? ['opening_nome_movimento', 'opening_sensorial_densa'] : []),
+            ...(mem?.lastAuditFlags?.endingSimilarityToRecentChapters === 'high' ? ['ending_pergunta_identitaria'] : []),
+        ],
+        imageryCooldown: imageryOveruse,
+        openingConstraint: mem?.lastAuditFlags?.openingSimilarityToRecentChapters === 'high'
+            ? 'Do not open with dense atmospheric sensation or protagonist-name-plus-motion. Start with interruption, action, dialogue, or blunt consequence.'
+            : 'Avoid defaulting to smell+taste+texture+architecture in the first paragraph.',
+        closingConstraint: mem?.lastAuditFlags?.endingSimilarityToRecentChapters === 'high'
+            ? 'Do not close with a rhetorical identity question. End on image, action, revelation, or irreversible choice.'
+            : 'Avoid generic rhetorical hooks; vary the ending mechanism.',
+        densityTarget: mem?.lastAuditFlags?.rhetoricalPatternCount && mem.lastAuditFlags.rhetoricalPatternCount >= 4 ? 'lean' : 'balanced',
         contradictionSummary: protagonist?.coreLie ? `Track contradictions against the protagonist lie: ${protagonist.coreLie}` : 'No protagonist lie registered.',
         liePressureSource: 'escalation',
         protagonistLieStability: mem?.lieStates?.find(state => state.characterId === protagonist?.id)?.lieStability ?? 10,
@@ -3107,12 +4360,18 @@ Previous Audit Flags:
   - Passive protagonist: ${mem?.lastAuditFlags?.passiveProtagonist || 'não'}
   - Scene check: ${mem?.lastAuditFlags?.sceneObjectiveCheck || 'ok'}
   - Overused words last chapter: ${newOveruse.join(', ') || 'none'}
+  - Overused imagery families last chapter: ${imageryOveruse.join(', ') || 'none'}
   - Currently on cooldown: ${activeCooldownWords.join(', ') || 'none'}
+  - Style patterns currently on cooldown: ${activeStylePatterns.join(', ') || 'none'}
   - Contrastive-negation crutch count: ${mem?.lastAuditFlags?.rhetoricalPatternCount ?? 0}
   - Contrastive-negation warning: ${mem?.lastAuditFlags?.rhetoricalPatternOveruse || 'none'}
+  - Opening similarity to recent chapters: ${mem?.lastAuditFlags?.openingSimilarityToRecentChapters || 'low'}
+  - Ending similarity to recent chapters: ${mem?.lastAuditFlags?.endingSimilarityToRecentChapters || 'low'}
 
 Active Timeline Pressures:
 ${activeTimelinePressure.map(entry => `- ${entry.title}: ${entry.content}`).join('\n') || '- none'}
+
+${structuralMeta}
 
 Return ONLY valid JSON:
 {
@@ -3122,6 +4381,11 @@ Return ONLY valid JSON:
   "characterFocus": "What the protagonist must actively confront or decide — a character action, not an emotion",
   "thematicConstraint": "One sentence: what thematic cost or question must press against every scene this chapter",
   "narrativePressure": "The GM-level tension to inject — a pressure on the world, not a prescribed action (e.g. 'Someone is about to betray trust')",
+  "rhetoricalBans": ["nao_x_mas_y", "nao_era_x_era_y"],
+  "imageryCooldown": ${JSON.stringify(imageryOveruse.slice(0, 8))},
+  "openingConstraint": "One sentence banning repeated opening behavior",
+  "closingConstraint": "One sentence banning repeated ending behavior",
+  "densityTarget": "lean | balanced | lush",
   "cooldownSubstitutions": [{ "term": "mirror", "note": "Do not name it directly; use sensory description, metaphor, action, or consequence instead." }],
   "contradictionSummary": "What fresh evidence or event now attacks the protagonist core lie",
   "liePressureSource": "betrayal | guilt | factual proof | failure | revelation | escalation",
@@ -3134,13 +4398,14 @@ Return ONLY valid JSON:
         temperature: 0.4,
         maxTokens: compactMode ? 1400 : 1800,
         label: 'Director · Análise',
-        provider: 'cerebras',
+        provider: getPreferredHighCapabilityProvider(),
     });
 
     // Ensure wordsToSetOnCooldown is populated — at minimum carry over new overuse
     if (!guidance.wordsToSetOnCooldown || guidance.wordsToSetOnCooldown.length === 0) {
         guidance.wordsToSetOnCooldown = newOveruse;
     }
+
 
     emitAgentOutput({
         agent: 'director',
@@ -3160,8 +4425,10 @@ const applyDirectorGuidance = (
     const chapterIdxNow = universe.chapters.length;
     const prevCooldown = universe.narrativeMemory?.lexicalCooldown ?? {};
     const prevCooldownGuidance = universe.narrativeMemory?.lexicalCooldownGuidance ?? {};
+    const prevStylePatternCooldown = universe.narrativeMemory?.stylePatternCooldown ?? {};
     const updatedCooldown: Record<string, number> = {};
     const updatedCooldownGuidance: Record<string, string> = {};
+    const updatedStylePatternCooldown: Record<string, number> = {};
 
     for (const [word, expiry] of Object.entries(prevCooldown)) {
         if (expiry > chapterIdxNow) {
@@ -3169,13 +4436,27 @@ const applyDirectorGuidance = (
             if (prevCooldownGuidance[word]) updatedCooldownGuidance[word] = prevCooldownGuidance[word];
         }
     }
+    for (const [pattern, expiry] of Object.entries(prevStylePatternCooldown)) {
+        if (expiry > chapterIdxNow) {
+            updatedStylePatternCooldown[pattern] = expiry;
+        }
+    }
 
     for (const word of directorGuidance.wordsToSetOnCooldown ?? []) {
         updatedCooldown[word.toLowerCase()] = chapterIdxNow + 2;
     }
+    for (const image of directorGuidance.imageryCooldown ?? []) {
+        updatedCooldown[image.toLowerCase()] = chapterIdxNow + 2;
+        if (!updatedCooldownGuidance[image.toLowerCase()]) {
+            updatedCooldownGuidance[image.toLowerCase()] = `Avoid centering the prose around "${image}" again so soon. Change the image family and dramatize through another concrete texture or action.`;
+        }
+    }
     for (const substitution of directorGuidance.cooldownSubstitutions ?? []) {
         if (!substitution.term?.trim()) continue;
         updatedCooldownGuidance[substitution.term.toLowerCase()] = substitution.note;
+    }
+    for (const pattern of directorGuidance.rhetoricalBans ?? []) {
+        updatedStylePatternCooldown[pattern] = chapterIdxNow + 2;
     }
 
     const protagonist = universe.characters[0];
@@ -3231,6 +4512,7 @@ const applyDirectorGuidance = (
             directorGuidance,
             lexicalCooldown: updatedCooldown,
             lexicalCooldownGuidance: updatedCooldownGuidance,
+            stylePatternCooldown: updatedStylePatternCooldown,
             lieStates: nextLieStates,
         } as NarrativeMemory,
     };
@@ -3258,6 +4540,387 @@ export interface AutogenProgress {
     phase: 'director' | 'weaver' | 'bard' | 'chronicler' | 'done' | 'aborted';
     currentUniverse: Universe;
 }
+
+const applyLongformProgress = (
+    universe: Universe,
+    blueprint: LongformBlueprint,
+    chapterNumber: number,
+): Universe => {
+    const chapterMeta = getBlueprintChapterMeta(blueprint, chapterNumber);
+    const completedMilestones = blueprint.milestones
+        .filter(item => item.chapter < chapterNumber)
+        .map(item => item.label);
+    const nextProgress: LongformProgressState = {
+        currentChapter: chapterNumber,
+        currentAct: chapterMeta?.actIndex ?? 1,
+        currentFunction: chapterMeta?.function,
+        currentMilestone: chapterMeta?.milestone,
+        completedMilestones,
+    };
+    return {
+        ...universe,
+        creationMode: 'autogen_longform',
+        longformBlueprint: blueprint,
+        longformProgress: nextProgress,
+    };
+};
+
+export const generateLongformBlueprint = async (
+    universe: Universe,
+    qualityMode: GenerationQualityMode = 'economy',
+): Promise<LongformBlueprint> => {
+    const preparedUniverse = ensureUniverseDefaults(universe);
+    const compactMode = isEconomyMode(qualityMode);
+    const protagonist = preparedUniverse.characters[0];
+    const effectiveLang = preparedUniverse.lang ?? preparedUniverse.storyProfile?.lang ?? 'pt';
+    const langMandateText = langMandate(effectiveLang);
+    const blueprintContext = buildLongformBlueprintContext(preparedUniverse, protagonist, compactMode);
+    const fallback = normalizeLongformBlueprint(buildFallbackLongformBlueprint(preparedUniverse), preparedUniverse);
+    const blueprintDirectives = buildCompactLongformBlueprintDirectives(preparedUniverse.storyProfile, effectiveLang);
+    const anchorPool = [
+        preparedUniverse.name,
+        protagonist?.name || '',
+        ...preparedUniverse.codex.factions.map(entry => entry.title),
+        ...preparedUniverse.codex.rules.map(entry => entry.title),
+        ...preparedUniverse.codex.timeline.map(entry => entry.title),
+    ].filter(Boolean);
+    const isGenericGoal = (goal: string) =>
+        BLUEPRINT_GENERIC_PATTERNS.some(pattern => pattern instanceof RegExp && pattern.test(goal)) ||
+        /concrete new cost|irreversible choice|custo concreto|escolha irrevers/i.test(goal);
+    const needsBlueprintRepair = (blueprint: LongformBlueprint) => {
+        const genericGoals = blueprint.chapterMap.filter(entry => isGenericGoal(entry.goal)).length;
+        const anchorlessGoals = blueprint.chapterMap.filter(entry => !blueprintTextHasNamedAnchor(entry.goal, anchorPool)).length;
+        const repeatedCore = blueprint.promise.trim() === blueprint.conflictCore.trim();
+        const mergedCore =
+            blueprint.promise.trim() === blueprint.protagonistFocus.trim() ||
+            blueprint.conflictCore.trim() === blueprint.protagonistFocus.trim();
+        const wrongLanguageActs = effectiveLang === 'pt'
+            ? blueprint.acts.some(act => /\bAct\b/i.test(act.label))
+            : blueprint.acts.some(act => /\bAto\b/i.test(act.label));
+        const genericActs = blueprint.acts.filter(act => !blueprintTextHasNamedAnchor(`${act.purpose} ${act.milestone}`, anchorPool)).length;
+        return genericGoals > 1 || anchorlessGoals > 6 || genericActs > 1 || repeatedCore || mergedCore || wrongLanguageActs;
+    };
+
+    emitAgentOutput({ agent: 'weaver', label: 'Longform Blueprint', status: 'thinking' });
+    const blueprintProvider: 'cerebras' | 'auto' = loadApiKeys()?.cerebras?.trim() ? 'cerebras' : 'auto';
+    const blueprintModel = loadApiKeys()?.cerebras?.trim() ? CEREBRAS_DEFAULT_MODEL : undefined;
+    const directivesText = blueprintDirectives.directivesText || (effectiveLang === 'en' ? 'Honor the selected profile naturally.' : 'Honre o perfil selecionado de forma natural.');
+
+    const coreFallback = {
+        title: fallback.title,
+        logline: fallback.logline,
+        promise: fallback.promise,
+        conflictCore: fallback.conflictCore,
+        protagonistFocus: fallback.protagonistFocus,
+    };
+
+    let blueprint: LongformBlueprint = fallback;
+
+    emitAgentOutput({ agent: 'weaver', label: 'Longform Blueprint · Core', status: 'thinking' });
+    const corePass = await chatJson<z.infer<typeof ZLongformBlueprintCore>>({
+        system: `Rewrite only the top-level identity of a seed longform blueprint.
+Return JSON only.
+No markdown. No explanations.
+Keep all fields concise and story-specific.
+promise, conflictCore, and protagonistFocus must be clearly distinct.`,
+        user: `${langMandateText}
+
+${blueprintContext}
+
+STRUCTURAL MODEL:
+- ${blueprintDirectives.model}
+
+MANDATORY DIRECTIVES:
+- ${directivesText}
+
+Rewrite only these fields so they become native to this universe:
+${JSON.stringify(coreFallback, null, 2)}
+
+Return:
+{
+  "title": "",
+  "logline": "",
+  "promise": "",
+  "conflictCore": "",
+  "protagonistFocus": ""
+}`,
+        fallback: coreFallback,
+        schema: ZLongformBlueprintCore,
+        model: blueprintModel,
+        temperature: 0.2,
+        maxTokens: 900,
+        label: 'Longform Blueprint · Core',
+        provider: blueprintProvider,
+    });
+    blueprint = normalizeLongformBlueprint({ ...blueprint, ...corePass }, preparedUniverse);
+    emitAgentOutput({ agent: 'weaver', label: 'Longform Blueprint · Core', status: 'done', summary: blueprint.title });
+
+    const actsFallback = {
+        acts: fallback.acts.map(act => ({
+            actIndex: act.actIndex,
+            label: act.label,
+            purpose: act.purpose,
+            milestone: act.milestone,
+        })),
+        milestones: fallback.milestones.map(item => ({
+            chapter: item.chapter,
+            label: item.label,
+            objective: item.objective,
+        })),
+    };
+
+    emitAgentOutput({ agent: 'weaver', label: 'Longform Blueprint · Acts', status: 'thinking' });
+    const actsPass = await chatJson<z.infer<typeof ZLongformBlueprintActsPass>>({
+        system: `Rewrite only the act and milestone text of a seed blueprint.
+Return JSON only.
+Preserve actIndex order and milestone chapters.
+Keep labels and objectives concise, specific, and anchored to named story material.`,
+        user: `${langMandateText}
+
+${blueprintContext}
+
+STRUCTURAL MODEL:
+- ${blueprintDirectives.model}
+
+MANDATORY DIRECTIVES:
+- ${directivesText}
+
+Rewrite this act structure so it becomes native to the universe:
+${JSON.stringify(actsFallback, null, 2)}
+
+Return:
+{
+  "acts": [{ "actIndex": 1, "label": "", "purpose": "", "milestone": "" }],
+  "milestones": [{ "chapter": 4, "label": "", "objective": "" }]
+}`,
+        fallback: actsFallback,
+        schema: ZLongformBlueprintActsPass,
+        model: blueprintModel,
+        temperature: 0.2,
+        maxTokens: 1400,
+        label: 'Longform Blueprint · Acts',
+        provider: blueprintProvider,
+    });
+    blueprint = normalizeLongformBlueprint({
+        ...blueprint,
+        acts: blueprint.acts.map((act, index) => ({
+            ...act,
+            ...actsPass.acts[index],
+            chapterStart: act.chapterStart,
+            chapterEnd: act.chapterEnd,
+        })),
+        milestones: blueprint.milestones.map((item, index) => ({
+            ...item,
+            ...actsPass.milestones[index],
+            chapter: item.chapter,
+        })),
+    }, preparedUniverse);
+    emitAgentOutput({ agent: 'weaver', label: 'Longform Blueprint · Acts', status: 'done', summary: `${blueprint.acts.length} acts refined` });
+
+    const chapterPassFallback = (actIndex: number) => ({
+        chapters: fallback.chapterMap
+            .filter(entry => entry.actIndex === actIndex)
+            .map(entry => ({
+                chapterNumber: entry.chapterNumber,
+                actIndex: entry.actIndex,
+                function: entry.function,
+                goal: entry.goal,
+                ...(entry.milestone ? { milestone: entry.milestone } : {}),
+            })),
+    });
+
+    for (const act of blueprint.acts) {
+        const currentChapterSlice = blueprint.chapterMap
+            .filter(entry => entry.actIndex === act.actIndex)
+            .map(entry => ({
+                chapterNumber: entry.chapterNumber,
+                actIndex: entry.actIndex,
+                function: entry.function,
+                goal: entry.goal,
+                ...(entry.milestone ? { milestone: entry.milestone } : {}),
+            }));
+        const sliceFallback = chapterPassFallback(act.actIndex);
+
+        emitAgentOutput({ agent: 'weaver', label: `Longform Blueprint · Act ${act.actIndex}`, status: 'thinking' });
+        const chapterPass = await chatJson<z.infer<typeof ZLongformBlueprintChapterPass>>({
+            system: `Rewrite chapter goals for one act of a seed blueprint.
+Return JSON only.
+Preserve chapterNumber, actIndex, and function exactly.
+Rewrite goal and optional milestone only.
+Every goal must be concrete, unique, and anchored to named story material.`,
+            user: `${langMandateText}
+
+${blueprintContext}
+
+ACT TO REWRITE:
+${JSON.stringify({
+    actIndex: act.actIndex,
+    label: act.label,
+    purpose: act.purpose,
+    milestone: act.milestone,
+    objective: blueprint.milestones.find(item => item.chapter === act.chapterEnd)?.objective || '',
+}, null, 2)}
+
+MANDATORY DIRECTIVES:
+- ${directivesText}
+
+CURRENT CHAPTER SLICE:
+${JSON.stringify(currentChapterSlice, null, 2)}
+
+SEED CHAPTER SLICE:
+${JSON.stringify(sliceFallback, null, 2)}
+
+RULES:
+- preserve chapterNumber, actIndex, and function exactly as given
+- keep each goal short and story-specific
+- mention named anchors from the context whenever possible
+- ban generic filler like hidden truth, price of victory, training, adaptation, false shelter, or central promise
+
+Return:
+{
+  "chapters": [{ "chapterNumber": 1, "actIndex": 1, "function": "setup", "goal": "", "milestone": "" }]
+}`,
+            fallback: sliceFallback,
+            schema: ZLongformBlueprintChapterPass,
+            model: blueprintModel,
+            temperature: 0.15,
+            maxTokens: compactMode ? 1100 : 1400,
+            label: `Longform Blueprint · Act ${act.actIndex}`,
+            provider: blueprintProvider,
+        });
+
+        const chapterMapByNumber = new Map(chapterPass.chapters.map(entry => [entry.chapterNumber, entry]));
+        blueprint = normalizeLongformBlueprint({
+            ...blueprint,
+            chapterMap: blueprint.chapterMap.map(entry => {
+                const rewritten = chapterMapByNumber.get(entry.chapterNumber);
+                if (!rewritten) return entry;
+                return {
+                    ...entry,
+                    goal: rewritten.goal,
+                    milestone: rewritten.milestone ?? entry.milestone,
+                };
+            }),
+        }, preparedUniverse);
+        emitAgentOutput({ agent: 'weaver', label: `Longform Blueprint · Act ${act.actIndex}`, status: 'done', summary: `${chapterPass.chapters.length} chapters refined` });
+    }
+
+    if (needsBlueprintRepair(blueprint)) {
+        blueprint = normalizeLongformBlueprint({
+            ...blueprint,
+            promise: blueprint.promise.trim() === blueprint.conflictCore.trim() ? fallback.promise : blueprint.promise,
+            conflictCore: blueprint.conflictCore.trim() === blueprint.protagonistFocus.trim() ? fallback.conflictCore : blueprint.conflictCore,
+            protagonistFocus: blueprint.protagonistFocus.trim() === blueprint.promise.trim() ? fallback.protagonistFocus : blueprint.protagonistFocus,
+            acts: blueprint.acts.map((act, index) =>
+                blueprintTextHasNamedAnchor(`${act.purpose} ${act.milestone}`, anchorPool)
+                    ? act
+                    : fallback.acts[index]
+            ),
+            milestones: blueprint.milestones.map((item, index) =>
+                blueprintTextHasNamedAnchor(`${item.label} ${item.objective}`, anchorPool)
+                    ? item
+                    : fallback.milestones[index]
+            ),
+            chapterMap: blueprint.chapterMap.map((entry, index) =>
+                (!isGenericGoal(entry.goal) && blueprintTextHasNamedAnchor(entry.goal, anchorPool))
+                    ? entry
+                    : fallback.chapterMap[index]
+            ),
+        }, preparedUniverse);
+    }
+
+    try {
+        emitAgentOutput({
+            agent: 'weaver',
+            label: 'Longform Blueprint',
+            status: 'done',
+            summary: `${blueprint.title} (${blueprint.targetChapters} chapters)`,
+            detail: JSON.stringify({
+                title: blueprint.title,
+                logline: blueprint.logline,
+                targetChapters: blueprint.targetChapters,
+                acts: blueprint.acts.map(act => ({
+                    actIndex: act.actIndex,
+                    label: act.label,
+                    chapterStart: act.chapterStart,
+                    chapterEnd: act.chapterEnd,
+                    milestone: act.milestone,
+                })),
+                chapterMapPreview: blueprint.chapterMap.slice(0, 6),
+            }, null, 2),
+        });
+    } catch (emitError) {
+        console.warn('[MythosEngine] Failed to emit final Longform Blueprint event.', emitError);
+    }
+
+    return blueprint;
+};
+
+export const runAutogenLongform = async (
+    universe: Universe,
+    blueprint: LongformBlueprint,
+    baseParams: Omit<ChapterGenerationParams, 'chapterIndex'>,
+    onProgress: (p: AutogenProgress) => void,
+    signal: AbortSignal,
+): Promise<Universe> => {
+    const totalChapters = Math.max(15, Math.min(20, blueprint.targetChapters || 18));
+    let current = {
+        ...ensureUniverseDefaults(universe),
+        creationMode: 'autogen_longform' as const,
+        longformBlueprint: blueprint,
+    };
+    const compactMode = isEconomyMode(baseParams.qualityMode);
+
+    for (let i = 0; i < totalChapters; i++) {
+        if (signal.aborted) {
+            onProgress({ chaptersDone: i, totalChapters, phase: 'aborted', currentUniverse: current });
+            return current;
+        }
+
+        const chapterNumber = current.chapters.length + 1;
+        const chapterMeta = getBlueprintChapterMeta(blueprint, chapterNumber);
+        current = applyLongformProgress(current, blueprint, chapterNumber);
+
+        onProgress({ chaptersDone: i, totalChapters, phase: 'director', currentUniverse: current });
+        const directorGuidance = await generateDirectorGuidance(current, compactMode);
+        current = applyDirectorGuidance(current, directorGuidance);
+
+        onProgress({ chaptersDone: i, totalChapters, phase: 'weaver', currentUniverse: current });
+
+        const { updatedUniverse } = await generateChapterWithAgents(current, {
+            ...baseParams,
+            chapterIndex: current.chapters.length,
+            directorPrepared: true,
+            longformMode: true,
+            targetChapterCount: totalChapters,
+            chapterFunction: chapterMeta?.function,
+            actIndex: chapterMeta?.actIndex,
+            milestoneFocus: chapterMeta?.milestone || chapterMeta?.goal,
+            title: chapterMeta?.goal ? '' : baseParams.title,
+            plotDirection: chapterMeta?.goal || baseParams.plotDirection,
+        });
+
+        current = {
+            ...updatedUniverse,
+            creationMode: 'autogen_longform',
+            longformBlueprint: blueprint,
+            longformProgress: current.longformProgress,
+        };
+
+        onProgress({
+            chaptersDone: i + 1,
+            totalChapters,
+            phase: i === totalChapters - 1 ? 'done' : 'chronicler',
+            currentUniverse: current,
+        });
+
+        if (i < totalChapters - 1 && AUTOGEN_INTER_CHAPTER_DELAY_MS > 0) {
+            await wait(AUTOGEN_INTER_CHAPTER_DELAY_MS);
+        }
+    }
+
+    return current;
+};
 
 export const generateStoryArc = async (
     universe: Universe,
@@ -3294,6 +4957,10 @@ export const generateStoryArc = async (
             phase: i === totalChapters - 1 ? 'done' : 'chronicler',
             currentUniverse: current,
         });
+
+        if (i < totalChapters - 1 && AUTOGEN_INTER_CHAPTER_DELAY_MS > 0) {
+            await wait(AUTOGEN_INTER_CHAPTER_DELAY_MS);
+        }
     }
 
     return current;
@@ -3568,6 +5235,7 @@ const updateNarrativeMemoryFromChronicler = (
         lexicalCooldownGuidance: prev?.lexicalCooldownGuidance,
         lieStates: prev?.lieStates,
         lexicalCooldown: prev?.lexicalCooldown,  // preserved — Director manages expiry each chapter
+        stylePatternCooldown: prev?.stylePatternCooldown,
         directorGuidance: prev?.directorGuidance,  // preserved — Director updates it each chapter
     };
 };
@@ -3784,6 +5452,9 @@ COMPLETENESS MANDATE:
         plan.chapterSummary.trim().length < 60 ||
         plan.endHook.trim().length < 24;
 
+    const weaverPlannerProvider: 'cerebras' = 'cerebras';
+    const weaverPlannerModel = CEREBRAS_WEAVER_MODEL;
+
     const repairPlan = async (plan: WeaverPlan, fallbackLabel: string): Promise<WeaverPlan> => {
         const repaired = await chatJson<WeaverPlan>({
             system: `${systemPrompt}
@@ -3798,9 +5469,11 @@ ${JSON.stringify(plan, null, 2)}
 
 Repair it now. Keep the same title direction, but make the summary and hook complete and ensure there are at least 5 useful beats.`,
             fallback: plan,
+            model: weaverPlannerModel,
             temperature: 0.35,
             label: `${fallbackLabel} · Repair`,
             maxTokens: 800,
+            provider: weaverPlannerProvider,
         });
 
         return normalizePlan(repaired, fallbackLabel);
@@ -3814,27 +5487,27 @@ Repair it now. Keep the same title direction, but make the summary and hook comp
     ];
 
     emitAgentOutput({ agent: 'weaver', label: 'Weaver · BVSR (3 planos)', status: 'thinking' });
+    const normalized: WeaverPlan[] = [];
+    for (let index = 0; index < configs.length; index++) {
+        const { temperature, label } = configs[index];
+        const fallbackLabel = label.split(' ?? ')[1] || `Plan ${index + 1}`;
+        const result = await chatJson<WeaverPlan>({
+            system: systemPrompt,
+            user: userPrompt,
+            fallback: { chapterTitle: fallbackLabel, scenes: [], chapterSummary: '', endHook: '' },
+            model: weaverPlannerModel,
+            temperature,
+            label,
+            maxTokens: 800,
+            provider: weaverPlannerProvider,
+        });
+        const plan = normalizePlan(result, fallbackLabel);
+        normalized.push(needsRepair(plan) ? await repairPlan(plan, fallbackLabel) : plan);
 
-    const results = await Promise.all(
-        configs.map(({ temperature, label }) =>
-            chatJson<WeaverPlan>({
-                system: systemPrompt,
-                user: userPrompt,
-                fallback: { chapterTitle: label.split(' · ')[1], scenes: [], chapterSummary: '', endHook: '' },
-                temperature,
-                label,
-                maxTokens: 800,
-            })
-        )
-    );
-
-    const normalized = await Promise.all(
-        results.map(async (result, index) => {
-            const fallbackLabel = configs[index]?.label.split(' · ')[1] || `Plan ${index + 1}`;
-            const plan = normalizePlan(result, fallbackLabel);
-            return needsRepair(plan) ? repairPlan(plan, fallbackLabel) : plan;
-        })
-    );
+        if (index < configs.length - 1 && WEAVER_PLAN_STAGGER_MS > 0) {
+            await wait(WEAVER_PLAN_STAGGER_MS);
+        }
+    }
 
     emitAgentOutput({ agent: 'weaver', label: 'Weaver · BVSR (3 planos)', status: 'done', summary: `${normalized.filter(p => p?.chapterTitle).length} planos gerados` });
 
@@ -3982,12 +5655,253 @@ ${issueList}
 ${chapter.content}
 
 Write the full rewritten chapter below. Output continuous prose only — no headers, no numbered sections, no preamble, no closing remarks.`,
-        model: BARD_CEREBRAS_MODEL,
         label: 'Bard · Reescrita',
-        provider: 'cerebras',
+        provider: getPreferredHighCapabilityProvider(),
     }).catch(() => chapter.content);
 
     return stripLLMPrefixes(prose);
+};
+
+export const generateLongformGenesisBase = async (
+    profile: StoryProfile,
+    onProgress: (step: string) => void,
+    lang?: 'pt' | 'en',
+    qualityMode: GenerationQualityMode = 'economy'
+): Promise<Universe> => {
+    const profileWithLang = lang ? { ...profile, lang } : profile;
+    const effectiveLang = lang ?? (profile as StoryProfile & { lang?: string }).lang ?? 'pt';
+    const skeletonIdea: UniverseIdea = { name: '', description: '', profile: { ...profileWithLang, lang: effectiveLang as 'pt' | 'en' } };
+    const compactMode = isEconomyMode(qualityMode);
+    const profileCtx = buildProfileContext(skeletonIdea.profile, compactMode);
+    const langMandateText = langMandate(effectiveLang);
+    const hasPremise = !!(skeletonIdea.profile?.premise?.trim());
+    const factionSeed = !hasPremise ? pickFactionArchetypes(compactMode ? 2 : 3).map(h => `- ${h}`).join('\n') : '';
+    const bgSeed = !hasPremise ? pickBackground() : '';
+    const premiseLock = hasPremise
+        ? '\nPREMISE LOCK ? NON-NEGOTIABLE: ALL world structure, factions, title, setting, conflict, and protagonist MUST derive directly from the user premise. Literary influences and tone are STYLE parameters ? they shape HOW the premise is told, not WHAT is invented.\n'
+        : '';
+
+    let uni: Universe = {
+        id: generateId(),
+        name: '',
+        description: '',
+        lastGenerated: new Date().toISOString(),
+        lang: effectiveLang,
+        codex: { overview: '', timeline: [], factions: [], rules: [] },
+        characters: [],
+        chapters: [],
+        assets: { visual: [], sound: [] },
+        agentConfigs: {},
+        storyProfile: skeletonIdea.profile,
+    };
+
+    onProgress('anchors');
+    const stepLabel = 'Architect · Universo e Ancoras';
+    emitAgentOutput({ agent: 'architect', label: stepLabel, status: 'thinking' });
+    const architectPrompt = getAgentPrompt(uni, 'architect', compactMode);
+    const anchorData = await chatJson<{
+        name?: string;
+        description?: string;
+        overview?: string;
+        setting?: string;
+        settingBelief?: string;
+        settingMyth?: string;
+        conflict?: string;
+        conflictBelief?: string;
+        conflictMyth?: string;
+        factions?: Array<{ title: string; content: string; belief?: string; myth?: string }>;
+    }>({
+        system: architectPrompt,
+        user: effectiveLang === 'en' ? `
+${langMandateText}
+${profileCtx}
+${premiseLock}
+You are creating a new fictional universe from scratch.
+Invent a unique, high-concept universe idea that perfectly suits the Story Profile, then immediately define its minimal anchors.
+Do NOT over-specify ? the world will emerge from the prose.
+TITLE RULES ? "name" is the TITLE OF THE LITERARY WORK (book/light novel/serial), not a planet or place name.
+Choose whatever title structure best fits the work ? single evocative words, phrases, questions, poetic fragments, verb-led titles are all valid.
+Examples of fitting structures (not obligatory): "Shadows of the Dead", "Ashes", "The Architect of Chaos", "Cold Blood", "Who Keeps the Fire"
+FORBIDDEN: a single invented proper noun used as a world/planet name ("Valdur", "Aetheria", "Eldoria"), "The Kingdom of X", "The World of Y".
+Return only valid JSON:
+{
+  "name": "Literary work title",
+  "description": "Evocative 25-30 word description capturing tone and themes",
+  "overview": "One paragraph setting atmosphere and central tension",
+  "setting": "Specific location where Chapter 1 takes place",
+  "conflict": "The inciting tension or threat driving the opening",
+  "factions": [{ "title": "Faction name (invented proper noun, not a genre label)", "content": "What the faction controls + what it structurally needs + who it structurally conflicts with (competing needs, not moral opposition)", "belief": "Optional: what insiders or nearby characters believe about this faction", "myth": "Optional: the city's rumor, propaganda, or sacred story about this faction" }],
+  "settingBelief": "Optional: what locals believe or fear about the opening location",
+  "settingMyth": "Optional: the folklore or public narrative surrounding the opening location",
+  "conflictBelief": "Optional: how characters misread or emotionally frame the opening conflict",
+  "conflictMyth": "Optional: the official, ritual, or cultural version of the opening conflict"
+}
+${factionSeed ? `FACTION STRUCTURE SEED (use these power structures ? invent proper names, do NOT copy verbatim):\n${factionSeed}\nGenerate 2-3 factions in structural tension. Avoid protagonist's side vs antagonist's side framing.` : 'Generate 2-3 factions that emerge from the user premise. Factions must compete for the specific resources or power the premise makes relevant.'}
+`
+: `
+${langMandateText}
+${profileCtx}
+${premiseLock}
+Voc? est? criando um universo ficcional do zero.
+Invente uma ideia de universo ?nica e de alto conceito que se encaixe perfeitamente no Perfil da Hist?ria, e ent?o defina suas ?ncoras m?nimas.
+N?O especifique demais ? o mundo emergir? da prosa.
+REGRAS DO T?TULO ? "name" ? o T?TULO DA OBRA LITER?RIA (livro/light novel/serial), n?o o nome de um planeta ou lugar.
+Escolha a estrutura de t?tulo que melhor encaixar na obra ? palavras ?nicas evocativas, frases, perguntas, fragmentos po?ticos, t?tulos com verbo, tudo ? v?lido.
+Exemplos de boas estruturas (n?o obrigat?rias): "As Sombras da Morte", "Cinzas", "O Arquiteto do Caos", "Sangue Frio", "Quem Guarda o Fogo"
+PROIBIDO: um ?nico substantivo pr?prio inventado como nome de mundo/planeta ("Valdur", "Aetheria", "Eldoria"), "O Reino de X", "O Mundo de Y".
+Retorne apenas JSON v?lido:
+{
+  "name": "T?tulo da obra liter?ria",
+  "description": "Descri??o evocativa de 25-30 palavras capturando tom e temas",
+  "overview": "Um par?grafo definindo atmosfera e tens?o central",
+  "setting": "Local espec?fico onde o Cap?tulo 1 acontece",
+  "conflict": "A tens?o incitante ou amea?a que impulsiona a abertura",
+  "factions": [{ "title": "Nome da fac??o (substantivo pr?prio inventado, n?o r?tulo de g?nero)", "content": "O que a fac??o controla + o que ela estruturalmente precisa + com quem conflita (necessidades concorrentes, n?o oposi??o moral)", "belief": "Opcional: o que membros ou v?timas acreditam sobre esta fac??o", "myth": "Opcional: o rumor, propaganda ou narrativa sagrada sobre esta fac??o" }],
+  "settingBelief": "Opcional: o que os locais acreditam ou temem sobre o cen?rio inicial",
+  "settingMyth": "Opcional: o folclore ou narrativa p?blica sobre o cen?rio inicial",
+  "conflictBelief": "Opcional: como os personagens interpretam errado ou emocionalmente o conflito inicial",
+  "conflictMyth": "Opcional: a vers?o oficial, ritual ou cultural do conflito inicial"
+}
+${factionSeed ? `FACTION STRUCTURE SEED (use estas estruturas de poder ? invente nomes pr?prios, N?O copie verbatim):\n${factionSeed}\nGere 2-3 fac??es em tens?o estrutural.` : 'Gere 2-3 fac??es que emergem da premissa do usu?rio. As fac??es devem competir pelos recursos espec?ficos relevantes ? premissa.'}
+`,
+        fallback: {},
+        temperature: 0.5,
+        label: stepLabel,
+        maxTokens: compactMode ? 1600 : 2000,
+        provider: 'cerebras',
+    });
+
+    if (anchorData.name) {
+        uni.name = anchorData.name;
+        uni.description = anchorData.description || anchorData.name;
+    }
+
+    emitAgentOutput({ agent: 'architect', label: stepLabel, status: 'done', summary: anchorData.overview?.slice(0, 120) || (anchorData.name ?? 'Ancoras criadas'), detail: JSON.stringify(anchorData, null, 2) });
+
+    uni.codex.overview = anchorData.overview || uni.description;
+    uni.codex.factions = (anchorData.factions || []).map(x => ensureCodexEntryDefaults({
+        id: generateId(),
+        title: x.title,
+        content: x.content,
+        truth: createLayeredTruthBundle(`faction:${normalizeTitle(x.title)}`, x.content, { belief: x.belief, myth: x.myth }),
+    }));
+
+    if (anchorData.setting) {
+        uni.codex.rules.push(ensureCodexEntryDefaults({
+            id: generateId(),
+            title: 'Initial Setting',
+            content: anchorData.setting,
+            aliases: ['Abertura', 'Cenario inicial'],
+            aiVisibility: 'global',
+            truth: createLayeredTruthBundle('rule:initial-setting', anchorData.setting, { belief: anchorData.settingBelief, myth: anchorData.settingMyth }),
+        }));
+    }
+    if (anchorData.conflict) {
+        uni.codex.rules.push(ensureCodexEntryDefaults({
+            id: generateId(),
+            title: 'Central Conflict',
+            content: anchorData.conflict,
+            aliases: ['Conflito central'],
+            aiVisibility: 'global',
+            truth: createLayeredTruthBundle('rule:central-conflict', anchorData.conflict, { belief: anchorData.conflictBelief, myth: anchorData.conflictMyth }),
+        }));
+    }
+
+    onProgress('characters');
+    emitAgentOutput({ agent: 'soulforger', label: 'Soulforger · Protagonista', status: 'thinking' });
+    const soulforgerPrompt = getAgentPrompt(uni, 'soulforger', compactMode);
+    const factionsList = uni.codex.factions.map(f => f.title).join(', ');
+    const protData = await chatJson<{
+        name?: string;
+        aliases?: string[];
+        role?: Character['role'];
+        faction?: string;
+        bio?: string;
+        age?: number;
+        alignment?: string;
+        ghost?: string;
+        lie?: string;
+    }>({
+        system: soulforgerPrompt,
+        user: effectiveLang === 'en' ? `
+${langMandateText}
+${profileCtx}
+Universe: "${uni.name}" ? ${uni.codex.overview}
+Factions: ${factionsList}
+
+Create ONE protagonist. Include their Ghost (past trauma) and Lie (misconception about the world).
+${bgSeed ? `BACKGROUND SEED (use this social position as starting point ? invent all names and details):\n${bgSeed}` : "Derive the protagonist's background and social position directly from the user premise and the world factions above."}
+Return only valid JSON:
+{
+  "name": "Name",
+  "aliases": ["Nickname or in-world title"],
+  "role": "Protagonista",
+  "faction": "Faction name",
+  "bio": "2-sentence biography including Ghost and Lie",
+  "age": 30,
+  "alignment": "Alignment",
+  "ghost": "A specific past DECISION the character made that caused harm ? not something that happened to them passively",
+  "lie": "A specific falsifiable belief that creates friction with trustworthy characters in this story"
+}
+`
+: `
+${langMandateText}
+${profileCtx}
+Universo: "${uni.name}" ? ${uni.codex.overview}
+Fac??es: ${factionsList}
+
+Crie UM protagonista. Inclua o Ghost (trauma do passado) e a Lie (vis?o equivocada do mundo).
+${bgSeed ? `BACKGROUND SEED (use esta posi??o social como ponto de partida ? invente todos os nomes e detalhes):\n${bgSeed}` : 'Derive o background e posi??o social do protagonista diretamente da premissa do usu?rio e das fac??es do mundo acima.'}
+Retorne apenas JSON v?lido:
+{
+  "name": "Nome",
+  "aliases": ["Apelido ou titulo usado no mundo"],
+  "role": "Protagonista",
+  "faction": "Nome da fac??o",
+  "bio": "Biografia de 2 frases incluindo Ghost e Lie",
+  "age": 30,
+  "alignment": "Alinhamento",
+  "ghost": "Uma DECIS?O espec?fica do passado que o personagem tomou e causou dano ? n?o algo que aconteceu com ele passivamente",
+  "lie": "Uma cren?a espec?fica e falsific?vel que cria conflito com personagens dignos de confian?a nesta hist?ria"
+}
+`,
+        fallback: {},
+        temperature: 0.5,
+        label: 'Soulforger · Protagonista',
+        maxTokens: compactMode ? 1400 : 1800,
+        provider: 'cerebras',
+    });
+
+    emitAgentOutput({ agent: 'soulforger', label: 'Soulforger · Protagonista', status: 'done', summary: protData.name || 'Protagonista criado sem nome — veja detail', detail: JSON.stringify(protData, null, 2) });
+
+    const protName = protData.name || (effectiveLang === 'en' ? 'Unknown Hero' : 'Her?i Desconhecido');
+    uni.characters.push({
+        id: generateId(),
+        name: protName,
+        aliases: normalizeAliasList(protData.aliases),
+        role: protData.role || 'Protagonista',
+        faction: (protData.faction || '').trim(),
+        age: protData.age || 25,
+        alignment: protData.alignment || 'N/A',
+        bio: protData.bio || (effectiveLang === 'en' ? 'A mysterious figure.' : 'Uma figura misteriosa.'),
+        ghost: protData.ghost,
+        coreLie: protData.lie,
+        status: 'Vivo',
+        notesPrivate: '',
+        aiVisibility: 'global',
+        tracking: { ...DEFAULT_TRACKING },
+        relationships: [],
+        chapters: [],
+        imageUrl: createPortraitUrl({
+            name: protName,
+            role: protData.role || 'Protagonista',
+            faction: (protData.faction || '').trim(),
+            seed: `${protName}|${protData.bio || ''}`,
+            size: 768,
+        }),
+    });
+
+    return ensureUniverseDefaults(uni);
 };
 
 export const generateDivineGenesis = async (
