@@ -104,6 +104,24 @@ export type TimelineDiscoveryKind =
   | 'present_discovery'
   | 'forecast';
 
+export type RuleEntryKind =
+  | 'system'
+  | 'magic'
+  | 'location'
+  | 'lore';
+
+export type TimelineImpact =
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'cataclysmic';
+
+export type TimelineScope =
+  | 'personal'
+  | 'local'
+  | 'faction'
+  | 'world';
+
 export interface Character {
   id: string;
   name: string;
@@ -243,9 +261,13 @@ export interface CodexEntry {
   aiVisibility: AIVisibility;
   tracking?: TrackingConfig;
   truth?: TruthBundle;
+  ruleKind?: RuleEntryKind;
   eventState?: TimelineEventState;
   discoveryKind?: TimelineDiscoveryKind;
+  timelineImpact?: TimelineImpact;
+  timelineScope?: TimelineScope;
   relatedEntityIds?: string[];
+  anchorCharacterIds?: string[];
   dependsOnIds?: string[];
 }
 

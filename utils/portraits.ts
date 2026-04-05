@@ -106,6 +106,45 @@ const createEditorialPortraitSvg = ({
 </svg>`;
 };
 
+const createConstellationAvatarSvg = ({
+    name,
+    role,
+    seed,
+    size,
+}: {
+    name: string;
+    role?: string;
+    seed: string;
+    size: number;
+}): string => {
+    const hash = hashString(seed);
+    const palette = PORTRAIT_PALETTES[hash % PORTRAIT_PALETTES.length];
+    const initials = getInitials(name);
+    const roleLabel = (role || 'Figura').toUpperCase();
+
+    return `
+<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 320 320" fill="none">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="35%" r="70%">
+      <stop offset="0%" stop-color="${palette.panel}" />
+      <stop offset="100%" stop-color="${palette.bg}" />
+    </radialGradient>
+    <radialGradient id="halo" cx="50%" cy="25%" r="60%">
+      <stop offset="0%" stop-color="${palette.line}" stop-opacity="0.3" />
+      <stop offset="100%" stop-color="${palette.line}" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+
+  <rect width="320" height="320" rx="160" fill="url(#bg)" />
+  <rect width="320" height="320" rx="160" fill="url(#halo)" />
+  <circle cx="160" cy="108" r="44" fill="${palette.shadow}" stroke="${palette.accent}" stroke-opacity="0.55" />
+  <path d="M92 246C92 184 122 156 160 156C198 156 228 184 228 246V264H92V246Z" fill="${palette.shadow}" stroke="${palette.accent}" stroke-opacity="0.38" />
+  <circle cx="160" cy="160" r="122" stroke="${palette.line}" stroke-opacity="0.24" />
+  <text x="160" y="126" text-anchor="middle" fill="${palette.accent}" font-size="18" font-family="Georgia, serif" letter-spacing="2">${initials}</text>
+  <text x="160" y="292" text-anchor="middle" fill="${palette.line}" fill-opacity="0.78" font-size="14" font-family="Georgia, serif" letter-spacing="3">${roleLabel}</text>
+</svg>`;
+};
+
 export const createPortraitUrl = ({
     name,
     role,
@@ -120,7 +159,9 @@ export const createPortraitUrl = ({
     size?: number;
 }): string => {
     const portraitSeed = seed || [name, role, faction].filter(Boolean).join('|');
-    const svg = createEditorialPortraitSvg({ name, role, faction, seed: portraitSeed, size });
+    const svg = (size ?? 256) <= 128
+        ? createConstellationAvatarSvg({ name, role, seed: portraitSeed, size: size ?? 256 })
+        : createEditorialPortraitSvg({ name, role, faction, seed: portraitSeed, size: size ?? 256 });
     return encodeSvg(svg);
 };
 

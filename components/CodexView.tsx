@@ -1,13 +1,13 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import type { Character, CodexEntry, Universe } from '../types';
+import type { Character, CodexEntry, RuleEntryKind, TimelineImpact, TimelineScope, Universe } from '../types';
 import Button from './ui/Button';
 import Modal from './ui/Modal';
 import CharacterPortrait from './ui/CharacterPortrait';
 import InlineHelp from './ui/InlineHelp';
 import { RelationshipConstellation } from './CharactersView';
 import { collectCharacterMentions, collectCodexEntryMentions, markUniverseDirty } from '../services/geminiService';
-import { BookOpen, ChevronDown, Clock, Edit3, Globe2, LayoutGrid, MapPin, Plus, Scale, Search, Share2, Shield, Sparkles, Users } from 'lucide-react';
+import { BookOpen, ChevronDown, Clock, Edit3, EyeOff, Globe2, LayoutGrid, MapPin, Plus, Radar, Scale, Search, Share2, Shield, Sparkles, Users } from 'lucide-react';
 import { useLanguage } from '../LanguageContext';
 
 type CodexBucket = 'timeline' | 'factions' | 'rules';
@@ -17,6 +17,7 @@ type CodexEntryDraft = {
   aliases: string;
   content: string;
   notesPrivate: string;
+  ruleKind: RuleEntryKind;
   aiVisibility: 'global' | 'tracked' | 'hidden';
   trackByAlias: boolean;
   caseSensitive: boolean;
@@ -27,7 +28,10 @@ type CodexEntryDraft = {
   truthNeedsReview: boolean;
   eventState: 'historical' | 'active_pressure' | 'latent' | 'resolved' | 'forecast';
   discoveryKind: 'past_occurrence' | 'present_discovery' | 'forecast';
+  timelineImpact: TimelineImpact;
+  timelineScope: TimelineScope;
   relatedEntities: string;
+  anchorCharacters: string;
 };
 
 const LOCATION_HINTS = ['bairro', 'torre', 'templo', 'cidade', 'reino', 'fortaleza', 'palacio', 'palácio', 'porto', 'floresta', 'ruina', 'ruína', 'distrito', 'megacidade', 'district', 'tower', 'temple', 'city', 'kingdom', 'forest'];
@@ -47,23 +51,47 @@ const includesSearch = (haystack: string, needle: string) => !needle || normaliz
 const toRoman = (n: number) => ROMAN[n] ?? String(n + 1);
 const normalizeLabel = (value: string) => normalize(value.trim());
 
-const sectionDefs = (t: (key: string) => string) => [
+const sectionDefs = (lang: 'pt' | 'en', t: (key: string) => string) => [
   { id: 'overview', label: t('codex.section.overview'), icon: <Globe2 className="h-4 w-4" /> },
   { id: 'characters', label: t('codex.section.characters'), icon: <Users className="h-4 w-4" /> },
   { id: 'factions', label: t('codex.section.factionsRealm'), icon: <Shield className="h-4 w-4" /> },
-  { id: 'laws', label: t('codex.section.lawsMagic'), icon: <Scale className="h-4 w-4" /> },
+  { id: 'systemsMagic', label: lang === 'en' ? 'Lore & Systems' : 'Lore & Sistemas', icon: <Scale className="h-4 w-4" /> },
   { id: 'locations', label: t('codex.section.locations'), icon: <MapPin className="h-4 w-4" /> },
   { id: 'timeline', label: t('codex.section.timeline'), icon: <Clock className="h-4 w-4" /> },
-  { id: 'lore', label: t('codex.section.loreConcepts'), icon: <Sparkles className="h-4 w-4" /> },
 ];
 
 const filterEntry = (entry: CodexEntry, search: string) => includesSearch([entry.title, entry.content, aliasString(entry.aliases), entry.notesPrivate ?? ''].join(' '), search);
 const filterCharacter = (character: Character, search: string) => includesSearch([character.name, character.role, character.faction, character.status, character.bio, character.alignment, aliasString(character.aliases), character.notesPrivate ?? ''].join(' '), search);
-const classifyRule = (entry: CodexEntry): 'location' | 'law' | 'lore' => {
+const classifyRule = (entry: CodexEntry): RuleEntryKind => {
+  if (entry.ruleKind) return entry.ruleKind;
   const blob = normalize(`${entry.title} ${entry.content}`);
   if (LOCATION_HINTS.some(hint => blob.includes(hint))) return 'location';
-  if (LAW_HINTS.some(hint => blob.includes(hint))) return 'law';
+  if (LAW_HINTS.some(hint => blob.includes(hint))) return normalize(entry.title).includes('mag') || normalize(entry.content).includes('mag') ? 'magic' : 'system';
   return 'lore';
+};
+
+const ruleKindLabel = (kind: RuleEntryKind, lang: 'pt' | 'en') => {
+  const labels = {
+    pt: { system: 'Sistema', magic: 'Magia & Poder', location: 'Local', lore: 'Lore' },
+    en: { system: 'System', magic: 'Magic & Power', location: 'Location', lore: 'Lore' },
+  } as const;
+  return labels[lang][kind];
+};
+
+const timelineImpactLabel = (value: TimelineImpact, lang: 'pt' | 'en') => {
+  const labels = {
+    pt: { low: 'baixo', medium: 'médio', high: 'alto', cataclysmic: 'cataclísmico' },
+    en: { low: 'low', medium: 'medium', high: 'high', cataclysmic: 'cataclysmic' },
+  } as const;
+  return labels[lang][value];
+};
+
+const timelineScopeLabel = (value: TimelineScope, lang: 'pt' | 'en') => {
+  const labels = {
+    pt: { personal: 'pessoal', local: 'local', faction: 'facção', world: 'mundo' },
+    en: { personal: 'personal', local: 'local', faction: 'faction', world: 'world' },
+  } as const;
+  return labels[lang][value];
 };
 
 const SectionBlock = ({ id, title, icon, subtitle, count, action, active = true, children }: { id: string; title: string; icon: React.ReactNode; subtitle: string; count?: number; action?: React.ReactNode; active?: boolean; children: React.ReactNode }) => (
@@ -82,6 +110,119 @@ const SectionBlock = ({ id, title, icon, subtitle, count, action, active = true,
     {children}
   </section>
 );
+
+const FieldBlock = ({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) => (
+  <div className="space-y-2">
+    <div>
+      <p className="text-[11px] font-bold uppercase tracking-[0.22em] text-stone-500">{label}</p>
+      {hint && <p className="mt-1 text-xs leading-5 text-stone-500">{hint}</p>}
+    </div>
+    {children}
+  </div>
+);
+
+const SegmentedToggle = ({ value, options, onChange }: { value: string; options: Array<{ value: string; label: string; meta?: string }>; onChange: (value: string) => void }) => (
+  <div className="inline-flex rounded-2xl border border-stone-200 bg-white p-1 shadow-sm">
+    {options.map(option => (
+      <button
+        key={option.value}
+        type="button"
+        onClick={() => onChange(option.value)}
+        className={`rounded-xl px-3 py-2 text-left text-xs font-semibold transition-colors ${value === option.value ? 'bg-stone-900 text-white' : 'text-stone-500 hover:bg-stone-100 hover:text-stone-900'}`}
+      >
+        <span className="block">{option.label}</span>
+        {option.meta && <span className={`mt-0.5 block text-[10px] font-medium ${value === option.value ? 'text-stone-300' : 'text-stone-400'}`}>{option.meta}</span>}
+      </button>
+    ))}
+  </div>
+);
+
+const EntryCollectionPanel = ({ title, subtitle, entries, addLabel, onAdd, onEdit, emptyTitle, emptyBody, accent = 'stone' }: { title: string; subtitle: string; entries: CodexEntry[]; addLabel: string; onAdd: () => void; onEdit: (entry: CodexEntry) => void; emptyTitle: string; emptyBody: string; accent?: 'stone' | 'amber' | 'sky' | 'violet' }) => {
+  const { lang } = useLanguage();
+  const accentStyles = {
+    stone: { border: 'border-stone-200', soft: 'bg-stone-50', badge: 'bg-stone-100 text-stone-700' },
+    amber: { border: 'border-amber-200', soft: 'bg-amber-50/70', badge: 'bg-amber-100 text-amber-800' },
+    sky: { border: 'border-sky-200', soft: 'bg-sky-50/70', badge: 'bg-sky-100 text-sky-800' },
+    violet: { border: 'border-violet-200', soft: 'bg-violet-50/70', badge: 'bg-violet-100 text-violet-800' },
+  } as const;
+  const tone = accentStyles[accent];
+
+  return (
+    <div className={`rounded-[26px] border ${tone.border} bg-white p-5 shadow-sm`}>
+      <div className="flex flex-col gap-4 border-b border-stone-100 pb-4 md:flex-row md:items-start md:justify-between">
+        <div>
+          <div className="flex items-center gap-2">
+            <h3 className="font-serif text-xl font-bold text-stone-900">{title}</h3>
+            <span className={`rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.2em] ${tone.badge}`}>{entries.length}</span>
+          </div>
+          <p className="mt-2 max-w-2xl text-sm leading-6 text-stone-500">{subtitle}</p>
+        </div>
+        <Button variant="ghost" size="sm" onClick={onAdd}>
+          <Plus className="mr-2 h-3.5 w-3.5" />
+          {addLabel}
+        </Button>
+      </div>
+
+      {entries.length === 0 ? (
+        <div className={`mt-4 rounded-2xl border border-dashed ${tone.border} ${tone.soft} p-6 text-center`}>
+          <p className="font-serif text-lg font-bold text-stone-900">{emptyTitle}</p>
+          <p className="mt-2 text-sm leading-6 text-stone-500">{emptyBody}</p>
+        </div>
+      ) : (
+        <div className="mt-4 grid gap-3 md:grid-cols-2">
+          {entries.map((entry, index) => (
+            <motion.button
+              key={entry.id}
+              type="button"
+              initial={{ opacity: 0, x: -8 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: index * 0.04 }}
+              onClick={() => onEdit(entry)}
+              className={`group rounded-2xl border ${tone.border} bg-white p-5 text-left shadow-sm transition-all hover:-translate-y-0.5 hover:shadow-md`}
+            >
+              <div className="mb-3 flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="font-serif text-lg font-bold text-stone-900">{entry.title}</p>
+                  {entry.aliases.length > 0 && <p className="mt-1 text-xs text-stone-400">Aliases: {aliasString(entry.aliases)}</p>}
+                </div>
+                <Edit3 className="h-4 w-4 flex-shrink-0 text-stone-300 transition-colors group-hover:text-stone-700" />
+              </div>
+              <div className="mb-3 flex flex-wrap gap-2">
+                {entry.ruleKind && <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] ${tone.badge}`}>{ruleKindLabel(entry.ruleKind, lang)}</span>}
+                <span className="rounded-full bg-stone-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-stone-600">{entry.aiVisibility}</span>
+              </div>
+              <p className="line-clamp-4 text-sm leading-7 text-stone-600">{entry.content}</p>
+            </motion.button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const VisibilityPresetCard = ({ active, title, body, tone, onClick }: { active: boolean; title: string; body: string; tone: 'global' | 'tracked' | 'hidden'; onClick: () => void }) => {
+  const toneStyles = {
+    global: active ? 'border-amber-400 bg-amber-50 shadow-amber-100' : 'border-amber-200/70 bg-white hover:border-amber-300',
+    tracked: active ? 'border-sky-400 bg-sky-50 shadow-sky-100' : 'border-sky-200/70 bg-white hover:border-sky-300',
+    hidden: active ? 'border-stone-500 bg-stone-100 shadow-stone-200' : 'border-stone-200 bg-white hover:border-stone-400',
+  } as const;
+
+  const toneBadge = {
+    global: 'bg-amber-100 text-amber-800',
+    tracked: 'bg-sky-100 text-sky-800',
+    hidden: 'bg-stone-200 text-stone-700',
+  } as const;
+
+  return (
+    <button type="button" onClick={onClick} className={`w-full rounded-2xl border p-4 text-left transition-all shadow-sm ${toneStyles[tone]}`}>
+      <div className="flex items-center justify-between gap-3">
+        <p className="font-serif text-base font-bold text-stone-900">{title}</p>
+        <span className={`rounded-full px-2 py-1 text-[10px] font-bold uppercase tracking-[0.22em] ${toneBadge[tone]}`}>{tone}</span>
+      </div>
+      <p className="mt-2 text-sm leading-6 text-stone-600">{body}</p>
+    </button>
+  );
+};
 
 const EntryModal = ({ open, title, bucket, value, mentions, onClose, onSave }: { open: boolean; title: string; bucket: CodexBucket; value: CodexEntryDraft; mentions: Array<{ label: string; excerpt: string; sourceType: string }>; onClose: () => void; onSave: (value: CodexEntryDraft) => void }) => {
   const { t, lang } = useLanguage();
@@ -109,9 +250,29 @@ const EntryModal = ({ open, title, bucket, value, mentions, onClose, onSave }: {
           <div className="space-y-4">
             <input className="w-full rounded-xl border border-stone-300 px-3 py-2" value={draft.title} onChange={e => setDraft(prev => ({ ...prev, title: e.target.value }))} placeholder={lang === 'en' ? 'Title' : 'Título'} />
             <input className="w-full rounded-xl border border-stone-300 px-3 py-2" value={draft.aliases} onChange={e => setDraft(prev => ({ ...prev, aliases: e.target.value }))} placeholder="Aliases" />
+            {bucket === 'rules' && (
+              <>
+                <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4 text-sm leading-6 text-stone-600">
+                  {lang === 'en'
+                    ? 'Systems explain how the world operates, magic explains how power works, locations anchor space, and lore holds myths, beliefs, and cultural memory.'
+                    : 'Sistemas explicam como o mundo opera, magia explica como o poder funciona, locais ancoram o espaço e lore guarda mitos, crenças e memória cultural.'}
+                </div>
+                <select className="w-full rounded-xl border border-stone-300 px-3 py-2" value={draft.ruleKind} onChange={e => setDraft(prev => ({ ...prev, ruleKind: e.target.value as RuleEntryKind }))}>
+                  <option value="system">{ruleKindLabel('system', lang)}</option>
+                  <option value="magic">{ruleKindLabel('magic', lang)}</option>
+                  <option value="location">{ruleKindLabel('location', lang)}</option>
+                  <option value="lore">{ruleKindLabel('lore', lang)}</option>
+                </select>
+              </>
+            )}
             <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-stone-500">
               <span>{lang === 'en' ? 'AI Visibility' : 'Visibilidade IA'}</span>
               <InlineHelp content={t('help.codex.aiVisibility')} />
+            </div>
+            <div className="grid gap-3 md:grid-cols-3">
+              <VisibilityPresetCard active={draft.aiVisibility === 'global'} tone="global" title={lang === 'en' ? 'Global anchor' : 'Âncora global'} body={lang === 'en' ? 'Always enters context. Use for hard canon, core rules, or central factions.' : 'Sempre entra no contexto. Use para cÃ¢none duro, regras centrais ou facÃ§Ãµes-chave.'} onClick={() => setDraft(prev => ({ ...prev, aiVisibility: 'global' }))} />
+              <VisibilityPresetCard active={draft.aiVisibility === 'tracked'} tone="tracked" title={lang === 'en' ? 'Tracked recall' : 'MemÃ³ria rastreada'} body={lang === 'en' ? 'Enters when the tracker detects names, aliases, or related pressure in the scene.' : 'Entra quando o tracker detecta nomes, aliases ou pressÃ£o relacionada na cena.'} onClick={() => setDraft(prev => ({ ...prev, aiVisibility: 'tracked' }))} />
+              <VisibilityPresetCard active={draft.aiVisibility === 'hidden'} tone="hidden" title={lang === 'en' ? 'Author-only' : 'SÃ³ autor'} body={lang === 'en' ? 'Stays in your archive, but is withheld from generation context.' : 'Fica no seu arquivo, mas nÃ£o entra no contexto de geraÃ§Ã£o.'} onClick={() => setDraft(prev => ({ ...prev, aiVisibility: 'hidden' }))} />
             </div>
             <select className="w-full rounded-xl border border-stone-300 px-3 py-2" value={draft.aiVisibility} onChange={e => setDraft(prev => ({ ...prev, aiVisibility: e.target.value as CodexEntryDraft['aiVisibility'] }))}>
               <option value="global">{lang === 'en' ? 'Always include' : 'Sempre incluir'}</option>
@@ -141,6 +302,21 @@ const EntryModal = ({ open, title, bucket, value, mentions, onClose, onSave }: {
                   <option value="forecast">{lang === 'en' ? 'Forecast' : 'Previsão'}</option>
                 </select>
                 <input className="w-full rounded-xl border border-stone-300 px-3 py-2" value={draft.relatedEntities} onChange={e => setDraft(prev => ({ ...prev, relatedEntities: e.target.value }))} placeholder={lang === 'en' ? 'Related entities (names/titles, comma separated)' : 'Entidades relacionadas (nomes/títulos, separados por vírgula)'} />
+                <div className="grid gap-3 md:grid-cols-2">
+                  <select className="w-full rounded-xl border border-stone-300 px-3 py-2" value={draft.timelineImpact} onChange={e => setDraft(prev => ({ ...prev, timelineImpact: e.target.value as TimelineImpact }))}>
+                    <option value="low">{lang === 'en' ? 'Impact: low' : 'Impacto: baixo'}</option>
+                    <option value="medium">{lang === 'en' ? 'Impact: medium' : 'Impacto: médio'}</option>
+                    <option value="high">{lang === 'en' ? 'Impact: high' : 'Impacto: alto'}</option>
+                    <option value="cataclysmic">{lang === 'en' ? 'Impact: cataclysmic' : 'Impacto: cataclísmico'}</option>
+                  </select>
+                  <select className="w-full rounded-xl border border-stone-300 px-3 py-2" value={draft.timelineScope} onChange={e => setDraft(prev => ({ ...prev, timelineScope: e.target.value as TimelineScope }))}>
+                    <option value="personal">{lang === 'en' ? 'Scope: personal' : 'Escopo: pessoal'}</option>
+                    <option value="local">{lang === 'en' ? 'Scope: local' : 'Escopo: local'}</option>
+                    <option value="faction">{lang === 'en' ? 'Scope: faction' : 'Escopo: facção'}</option>
+                    <option value="world">{lang === 'en' ? 'Scope: world' : 'Escopo: mundo'}</option>
+                  </select>
+                </div>
+                <input className="w-full rounded-xl border border-stone-300 px-3 py-2" value={draft.anchorCharacters} onChange={e => setDraft(prev => ({ ...prev, anchorCharacters: e.target.value }))} placeholder={lang === 'en' ? 'Anchor characters (names, comma separated)' : 'Personagens âncora (nomes, separados por vírgula)'} />
               </>
             )}
             <textarea className="h-32 w-full rounded-xl border border-stone-300 px-3 py-2 resize-none" value={draft.content} onChange={e => setDraft(prev => ({ ...prev, content: e.target.value }))} placeholder={lang === 'en' ? 'AI-facing content' : 'Conteúdo para IA'} />
@@ -194,6 +370,9 @@ const EntryModal = ({ open, title, bucket, value, mentions, onClose, onSave }: {
 
         {tab === 'tracking' && (
           <div className="space-y-4">
+            <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4 text-sm leading-6 text-stone-600">
+              {lang === 'en' ? 'Tracked entries are found by name and aliases. Exclusions reduce false positives; case-sensitive mode is useful only for very specific spellings.' : 'Entradas rastreadas sÃ£o encontradas por nome e aliases. ExclusÃµes reduzem falsos positivos; modo sensÃ­vel a maiÃºsculas sÃ³ ajuda em grafias muito especÃ­ficas.'}
+            </div>
             <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-stone-500">
               <span>Tracking</span>
               <InlineHelp content={t('help.codex.tracking')} />
@@ -263,12 +442,17 @@ const CharacterModal = ({ character, mentions, onClose, onSave }: { character: C
                 <input className="rounded-xl border border-stone-300 px-3 py-2" value={draft.faction} onChange={e => setDraft(prev => prev ? { ...prev, faction: e.target.value } : prev)} placeholder={lang === 'en' ? 'Faction' : 'Facção'} />
                 <input className="rounded-xl border border-stone-300 px-3 py-2" type="number" value={draft.age} onChange={e => setDraft(prev => prev ? { ...prev, age: Number(e.target.value) } : prev)} placeholder={lang === 'en' ? 'Age' : 'Idade'} />
                 <input className="rounded-xl border border-stone-300 px-3 py-2" value={draft.alignment} onChange={e => setDraft(prev => prev ? { ...prev, alignment: e.target.value } : prev)} placeholder={lang === 'en' ? 'Alignment' : 'Alinhamento'} />
-                <select className="rounded-xl border border-stone-300 px-3 py-2" value={draft.aiVisibility} onChange={e => setDraft(prev => prev ? { ...prev, aiVisibility: e.target.value as Character['aiVisibility'] } : prev)}>
+                <select className="rounded-xl border border-stone-300 px-3 py-2 md:col-span-2" value={draft.aiVisibility} onChange={e => setDraft(prev => prev ? { ...prev, aiVisibility: e.target.value as Character['aiVisibility'] } : prev)}>
                   <option value="global">{lang === 'en' ? 'Always include' : 'Sempre incluir'}</option>
                   <option value="tracked">{lang === 'en' ? 'Include when detected' : 'Incluir quando detectado'}</option>
                   <option value="hidden">{lang === 'en' ? 'Never include' : 'Nunca incluir'}</option>
                 </select>
               </div>
+            </div>
+            <div className="grid gap-3 md:grid-cols-3">
+              <VisibilityPresetCard active={draft.aiVisibility === 'global'} tone="global" title={lang === 'en' ? 'Always remember' : 'Sempre lembrar'} body={lang === 'en' ? 'Use for protagonist, key antagonists, or anyone whose state must stay active.' : 'Use para protagonista, antagonistas-chave ou quem precisa permanecer vivo na memÃ³ria do motor.'} onClick={() => setDraft(prev => prev ? { ...prev, aiVisibility: 'global' } : prev)} />
+              <VisibilityPresetCard active={draft.aiVisibility === 'tracked'} tone="tracked" title={lang === 'en' ? 'Recall on mention' : 'Lembrar ao citar'} body={lang === 'en' ? 'Good for supporting cast. The engine pulls them in when names or aliases appear.' : 'Bom para elenco de apoio. O motor puxa esse personagem quando nomes ou aliases aparecem.'} onClick={() => setDraft(prev => prev ? { ...prev, aiVisibility: 'tracked' } : prev)} />
+              <VisibilityPresetCard active={draft.aiVisibility === 'hidden'} tone="hidden" title={lang === 'en' ? 'Private sheet' : 'Ficha privada'} body={lang === 'en' ? 'Keeps notes and draft intent without steering generation yet.' : 'MantÃ©m notas e intenÃ§Ãµes de rascunho sem empurrar a geraÃ§Ã£o agora.'} onClick={() => setDraft(prev => prev ? { ...prev, aiVisibility: 'hidden' } : prev)} />
             </div>
             <textarea className="h-32 w-full rounded-xl border border-stone-300 px-3 py-2 resize-none" value={draft.bio} onChange={e => setDraft(prev => prev ? { ...prev, bio: e.target.value } : prev)} placeholder={lang === 'en' ? 'AI-facing bio' : 'Bio para IA'} />
             <textarea className="h-24 w-full rounded-xl border border-stone-300 px-3 py-2 resize-none" value={draft.ghost ?? ''} onChange={e => setDraft(prev => prev ? { ...prev, ghost: e.target.value } : prev)} placeholder={lang === 'en' ? 'Ghost: the past decision that still haunts this character' : 'Ghost: a decisão do passado que ainda assombra este personagem'} />
@@ -302,6 +486,9 @@ const CharacterModal = ({ character, mentions, onClose, onSave }: { character: C
 
         {tab === 'tracking' && (
           <div className="space-y-4">
+            <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4 text-sm leading-6 text-stone-600">
+              {lang === 'en' ? 'Characters marked as tracked are found by name and aliases. Add exclusions for ambiguous surnames or titles that appear too often.' : 'Personagens marcados como rastreados sÃ£o encontrados por nome e aliases. Adicione exclusÃµes para sobrenomes ou tÃ­tulos ambÃ­guos que aparecem demais.'}
+            </div>
             <label className="flex items-center gap-3 text-sm text-stone-700">
               <input type="checkbox" checked={draft.tracking?.trackByAlias ?? true} onChange={e => setDraft(prev => prev ? { ...prev, tracking: { trackByAlias: e.target.checked, caseSensitive: prev.tracking?.caseSensitive ?? false, exclusions: prev.tracking?.exclusions ?? [] } } : prev)} />
               {lang === 'en' ? 'Track this character by name and aliases.' : 'Rastrear este personagem por nome e aliases.'}
@@ -325,7 +512,7 @@ const CharacterModal = ({ character, mentions, onClose, onSave }: { character: C
 
 export default function CodexView({ universe, onUpdateUniverse, initialSection = 'overview' }: { universe: Universe; onUpdateUniverse?: (universe: Universe) => void; isLoading: boolean; initialSection?: string }) {
   const { t, lang } = useLanguage();
-  const sections = useMemo(() => sectionDefs(t), [t]);
+  const sections = useMemo(() => sectionDefs(lang, t), [lang, t]);
   const [activeSection, setActiveSection] = useState(initialSection);
   const [search, setSearch] = useState('');
   const [projectEditorOpen, setProjectEditorOpen] = useState(false);
@@ -333,13 +520,14 @@ export default function CodexView({ universe, onUpdateUniverse, initialSection =
   const [entryEditor, setEntryEditor] = useState<{ bucket: CodexBucket; title: string; entry: CodexEntry | null } | null>(null);
   const [characterEditor, setCharacterEditor] = useState<CharacterDraft>(null);
   const [characterLens, setCharacterLens] = useState<'cards' | 'relations'>('cards');
+  const [lawLens, setLawLens] = useState<'systems' | 'magic'>('systems');
 
   useEffect(() => {
     setProjectDraft({ name: universe.name, subtitle: universe.subtitle ?? '', description: universe.description, overview: universe.codex.overview, notesPrivate: universe.notesPrivate ?? '' });
   }, [universe.name, universe.subtitle, universe.description, universe.codex.overview, universe.notesPrivate]);
 
   useEffect(() => {
-    setActiveSection(initialSection);
+    setActiveSection(initialSection === 'laws' ? 'systemsMagic' : initialSection);
   }, [initialSection]);
 
   const characters = useMemo(() => universe.characters.filter(character => filterCharacter(character, search)), [universe.characters, search]);
@@ -347,14 +535,57 @@ export default function CodexView({ universe, onUpdateUniverse, initialSection =
   const timeline = useMemo(() => universe.codex.timeline.filter(entry => filterEntry(entry, search)), [universe.codex.timeline, search]);
   const rules = useMemo(() => universe.codex.rules.filter(entry => filterEntry(entry, search)), [universe.codex.rules, search]);
   const locations = useMemo(() => rules.filter(entry => classifyRule(entry) === 'location'), [rules]);
-  const laws = useMemo(() => rules.filter(entry => classifyRule(entry) === 'law'), [rules]);
+  const systems = useMemo(() => rules.filter(entry => classifyRule(entry) === 'system'), [rules]);
+  const magic = useMemo(() => rules.filter(entry => classifyRule(entry) === 'magic'), [rules]);
   const lore = useMemo(() => rules.filter(entry => classifyRule(entry) === 'lore'), [rules]);
+  const activeLawEntries = lawLens === 'systems' ? systems : magic;
+  const latestTimelineEntry = useMemo(() => universe.codex.timeline[0] ?? null, [universe.codex.timeline]);
+  const activePressureEntries = useMemo(() => universe.codex.timeline.filter(entry => entry.eventState === 'active_pressure').slice(0, 2), [universe.codex.timeline]);
 
-  const counts = { overview: 1, characters: characters.length, factions: factions.length, laws: laws.length, locations: locations.length, timeline: timeline.length, lore: lore.length };
+  const counts = { overview: 1, characters: characters.length, factions: factions.length, systemsMagic: systems.length + magic.length, locations: locations.length, timeline: timeline.length };
+  const memoryProfile = useMemo(() => {
+    const codexEntries = [...universe.codex.factions, ...universe.codex.rules, ...universe.codex.timeline];
+    const entities = [...universe.characters, ...codexEntries];
+    const visibility = entities.reduce((acc, entity) => {
+      const mode = entity.aiVisibility ?? 'tracked';
+      acc[mode] += 1;
+      return acc;
+    }, { global: 0, tracked: 0, hidden: 0 });
+    const trackedByAlias = entities.filter(entity => (entity.tracking?.trackByAlias ?? true)).length;
+    const withExclusions = entities.filter(entity => (entity.tracking?.exclusions?.length ?? 0) > 0).length;
+    const openLoops = universe.narrativeMemory?.openLoops?.filter(loop => loop.resolved === undefined).length ?? 0;
+    const activePressure = universe.codex.timeline.filter(entry => entry.eventState === 'active_pressure').length;
+    return { visibility, trackedByAlias, withExclusions, openLoops, activePressure };
+  }, [universe]);
+  const overviewHighlights = useMemo(() => {
+    const items: Array<{ label: string; value: string }> = [];
+    if (universe.subtitle?.trim()) {
+      items.push({ label: lang === 'en' ? 'Logline' : 'Logline', value: universe.subtitle.trim() });
+    }
+    if (latestTimelineEntry?.title?.trim()) {
+      items.push({ label: lang === 'en' ? 'Current narrative state' : 'Estado atual da narrativa', value: latestTimelineEntry.title.trim() });
+    }
+    if (memoryProfile.openLoops > 0) {
+      items.push({
+        label: lang === 'en' ? 'Open tension' : 'Tensão em aberto',
+        value: `${memoryProfile.openLoops} ${lang === 'en' ? 'live loop(s) still pulling future chapters.' : 'loop(s) ainda puxando os próximos capítulos.'}`,
+      });
+    }
+    return items.slice(0, 3);
+  }, [lang, latestTimelineEntry, memoryProfile.openLoops, universe.subtitle]);
 
   const navTo = (id: string) => {
     setActiveSection(id);
   };
+
+  useEffect(() => {
+    if (lawLens === 'systems' && systems.length === 0 && magic.length > 0) {
+      setLawLens('magic');
+    }
+    if (lawLens === 'magic' && magic.length === 0 && systems.length > 0) {
+      setLawLens('systems');
+    }
+  }, [lawLens, systems.length, magic.length]);
 
   const entityCatalog = useMemo(() => [
     ...universe.characters.map(item => ({ id: item.id, label: item.name })),
@@ -362,6 +593,7 @@ export default function CodexView({ universe, onUpdateUniverse, initialSection =
     ...universe.codex.rules.map(item => ({ id: item.id, label: item.title })),
     ...universe.codex.timeline.map(item => ({ id: item.id, label: item.title })),
   ], [universe]);
+  const characterCatalog = useMemo(() => universe.characters.map(item => ({ id: item.id, label: item.name })), [universe.characters]);
 
   const resolveRelatedEntityIds = (labels: string) => {
     const wanted = splitAliases(labels).map(normalizeLabel);
@@ -391,11 +623,11 @@ export default function CodexView({ universe, onUpdateUniverse, initialSection =
     setProjectEditorOpen(false);
   };
 
-  const openEntryEditor = (bucket: CodexBucket, title: string, entry?: CodexEntry) => {
+  const openEntryEditor = (bucket: CodexBucket, title: string, entry?: CodexEntry, preset?: Partial<CodexEntry>) => {
     setEntryEditor({
       bucket,
       title,
-      entry: entry ?? { id: Math.random().toString(36).slice(2, 11), title: '', aliases: [], content: '', notesPrivate: '', aiVisibility: bucket === 'rules' ? 'global' : 'tracked', tracking: { trackByAlias: true, caseSensitive: false, exclusions: [] }, truth: { eventKey: `entry:${Math.random().toString(36).slice(2, 11)}`, layers: [], needsReview: false }, eventState: bucket === 'timeline' ? 'historical' : undefined, discoveryKind: bucket === 'timeline' ? 'past_occurrence' : undefined, relatedEntityIds: [] },
+      entry: entry ?? { id: Math.random().toString(36).slice(2, 11), title: '', aliases: [], content: '', notesPrivate: '', aiVisibility: bucket === 'rules' ? 'global' : 'tracked', tracking: { trackByAlias: true, caseSensitive: false, exclusions: [] }, truth: { eventKey: `entry:${Math.random().toString(36).slice(2, 11)}`, layers: [], needsReview: false }, ruleKind: bucket === 'rules' ? 'system' : undefined, eventState: bucket === 'timeline' ? 'historical' : undefined, discoveryKind: bucket === 'timeline' ? 'past_occurrence' : undefined, timelineImpact: bucket === 'timeline' ? 'medium' : undefined, timelineScope: bucket === 'timeline' ? 'personal' : undefined, relatedEntityIds: [], anchorCharacterIds: [], ...preset },
     });
   };
 
@@ -412,12 +644,18 @@ export default function CodexView({ universe, onUpdateUniverse, initialSection =
       aliases: splitAliases(draft.aliases),
       content: draft.content,
       notesPrivate: draft.notesPrivate,
+      ruleKind: entryEditor.bucket === 'rules' ? draft.ruleKind : entryEditor.entry.ruleKind,
       aiVisibility: draft.aiVisibility,
       eventState: entryEditor.bucket === 'timeline' ? draft.eventState : entryEditor.entry.eventState,
       discoveryKind: entryEditor.bucket === 'timeline' ? draft.discoveryKind : entryEditor.entry.discoveryKind,
+      timelineImpact: entryEditor.bucket === 'timeline' ? draft.timelineImpact : entryEditor.entry.timelineImpact,
+      timelineScope: entryEditor.bucket === 'timeline' ? draft.timelineScope : entryEditor.entry.timelineScope,
       relatedEntityIds: entryEditor.bucket === 'timeline'
         ? resolveRelatedEntityIds(draft.relatedEntities)
         : (entryEditor.entry.relatedEntityIds ?? []),
+      anchorCharacterIds: entryEditor.bucket === 'timeline'
+        ? characterCatalog.filter(item => splitAliases(draft.anchorCharacters).map(normalizeLabel).includes(normalizeLabel(item.label))).map(item => item.id)
+        : (entryEditor.entry.anchorCharacterIds ?? []),
       tracking: {
         trackByAlias: draft.trackByAlias,
         caseSensitive: draft.caseSensitive,
@@ -504,22 +742,182 @@ export default function CodexView({ universe, onUpdateUniverse, initialSection =
                 <h1 className="font-serif text-3xl font-bold text-white md:text-4xl">{universe.name}</h1>
                 {universe.subtitle && <p className="mt-2 text-sm italic text-stone-300">{universe.subtitle}</p>}
                 {universe.description && <p className="mt-5 max-w-3xl font-serif text-base leading-8 text-stone-200/92">{universe.description}</p>}
+                {overviewHighlights.length > 0 && (
+                  <div className="mt-6 grid gap-3 md:grid-cols-3">
+                    {overviewHighlights.map(item => (
+                      <div key={item.label} className="rounded-2xl border border-white/10 bg-white/5 p-4 backdrop-blur">
+                        <p className="text-[10px] uppercase tracking-[0.24em] text-nobel/60">{item.label}</p>
+                        <p className="mt-2 text-sm leading-6 text-stone-100">{item.value}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
-            <div className="mt-6 grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
-              <div className="rounded-2xl border border-amber-100 bg-amber-50/60 p-6">
+            <div className="mt-6 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <div className="hidden">
                 <p className="mb-3 text-[10px] uppercase tracking-[0.28em] text-stone-500">{t('codex.hero.aiOverview')}</p>
                 <p className="font-serif text-[1.02rem] leading-8 text-stone-700">{universe.codex.overview || t('codex.empty.overview')}</p>
               </div>
-              <div className="rounded-2xl border border-stone-200 bg-white p-6">
+              <div className="hidden">
                 <p className="mb-4 text-[10px] uppercase tracking-[0.28em] text-stone-500">{t('codex.hero.state')}</p>
                 <div className="space-y-3">
-                  {[{ label: lang === 'en' ? 'Characters' : 'Personagens', value: universe.characters.length }, { label: lang === 'en' ? 'Factions' : 'Facções', value: universe.codex.factions.length }, { label: lang === 'en' ? 'Locations / Laws / Lore' : 'Locais / Leis / Lore', value: universe.codex.rules.length }, { label: lang === 'en' ? 'Events' : 'Eventos', value: universe.codex.timeline.length }].map(item => (
+                  {[{ label: lang === 'en' ? 'Characters' : 'Personagens', value: universe.characters.length }, { label: lang === 'en' ? 'Factions' : 'Facções', value: universe.codex.factions.length }, { label: lang === 'en' ? 'Systems / Magic / Lore' : 'Sistemas / Magia / Lore', value: universe.codex.rules.length }, { label: lang === 'en' ? 'Events' : 'Eventos', value: universe.codex.timeline.length }].map(item => (
                     <div key={item.label} className="flex items-center justify-between border-b border-stone-100 pb-3 last:border-b-0 last:pb-0">
                       <span className="text-sm text-stone-500">{item.label}</span>
                       <span className="font-mono text-sm font-bold text-stone-900">{item.value}</span>
                     </div>
                   ))}
+                </div>
+              </div>
+              {[{ label: lang === 'en' ? 'Characters' : 'Personagens', value: universe.characters.length }, { label: lang === 'en' ? 'Factions' : 'Facções', value: universe.codex.factions.length }, { label: lang === 'en' ? 'Rules & Lore' : 'Regras & Lore', value: universe.codex.rules.length }, { label: lang === 'en' ? 'Events' : 'Eventos', value: universe.codex.timeline.length }].map(item => (
+                <div key={item.label} className="rounded-2xl border border-stone-200 bg-white px-4 py-3 shadow-sm">
+                  <p className="text-[10px] uppercase tracking-[0.24em] text-stone-400">{item.label}</p>
+                  <p className="mt-2 font-mono text-2xl font-bold text-stone-900">{item.value}</p>
+                </div>
+              ))}
+            </div>
+            <div className="mt-6 grid gap-4 xl:grid-cols-[1.35fr_0.65fr]">
+              <div className="space-y-4">
+                <div className="rounded-[26px] border border-amber-100 bg-amber-50/55 p-7 shadow-sm">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <p className="text-[10px] uppercase tracking-[0.28em] text-stone-500">{t('codex.hero.aiOverview')}</p>
+                      <h3 className="mt-2 font-serif text-2xl font-bold text-stone-900">{lang === 'en' ? 'Story memory in plain language' : 'Memória da história em linguagem clara'}</h3>
+                    </div>
+                    <div className="rounded-full border border-amber-200 bg-white/80 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.22em] text-stone-500">
+                      {memoryProfile.openLoops} {lang === 'en' ? 'open loops' : 'loops abertos'}
+                    </div>
+                  </div>
+                  <p className="mt-4 font-serif text-[1.06rem] leading-8 text-stone-700">{universe.codex.overview || t('codex.empty.overview')}</p>
+                </div>
+                <div className="grid gap-4 lg:grid-cols-[1fr_0.9fr]">
+                  <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
+                    <p className="text-[10px] uppercase tracking-[0.26em] text-stone-500">{lang === 'en' ? 'Current story state' : 'Estado atual da história'}</p>
+                    <div className="mt-4 space-y-4">
+                      <div>
+                        <p className="text-xs uppercase tracking-[0.22em] text-stone-400">{lang === 'en' ? 'Latest chapter pressure' : 'Pressão mais recente'}</p>
+                        <p className="mt-2 font-serif text-xl font-bold text-stone-900">{latestTimelineEntry?.title || (lang === 'en' ? 'No timeline event yet' : 'Nenhum evento de timeline ainda')}</p>
+                        <p className="mt-2 text-sm leading-6 text-stone-600">{latestTimelineEntry?.content || (lang === 'en' ? 'As chapters are generated, the latest event will appear here as the current narrative state.' : 'Conforme os capítulos forem gerados, o último evento aparece aqui como o estado narrativo atual.')}</p>
+                      </div>
+                      {activePressureEntries.length > 0 && (
+                        <div className="border-t border-stone-100 pt-4">
+                          <p className="text-xs uppercase tracking-[0.22em] text-stone-400">{lang === 'en' ? 'Pressure now' : 'Tensão agora'}</p>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {activePressureEntries.map(entry => (
+                              <span key={entry.id} className="rounded-full bg-rose-50 px-3 py-1 text-xs font-semibold text-rose-700">{entry.title}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] uppercase tracking-[0.26em] text-stone-500">{lang === 'en' ? 'AI memory panel' : 'Painel de memória da IA'}</p>
+                        <h4 className="mt-2 font-serif text-xl font-bold text-stone-900">{lang === 'en' ? 'What the engine keeps active' : 'O que o motor mantém ativo'}</h4>
+                      </div>
+                      <div className="rounded-2xl border border-stone-200 bg-stone-50 p-2">
+                        <Radar className="h-4 w-4 text-nobel" />
+                      </div>
+                    </div>
+                    <p className="mt-3 text-sm leading-6 text-stone-600">
+                      {lang === 'en' ? 'This is the technical layer behind continuity. Keep it close, but secondary to the story itself.' : 'Esta é a camada técnica por trás da continuidade. Ela ajuda bastante, mas deve ficar atrás da própria história.'}
+                    </p>
+                    <div className="mt-4 grid gap-3">
+                      <div className="flex items-center justify-between rounded-xl bg-amber-50 px-3 py-3">
+                        <span className="text-sm text-stone-600">{lang === 'en' ? 'Global anchors' : 'Âncoras globais'}</span>
+                        <span className="font-mono text-sm font-bold text-stone-900">{memoryProfile.visibility.global}</span>
+                      </div>
+                      <div className="flex items-center justify-between rounded-xl bg-sky-50 px-3 py-3">
+                        <span className="text-sm text-stone-600">{lang === 'en' ? 'Tracked entries' : 'Entradas rastreadas'}</span>
+                        <span className="font-mono text-sm font-bold text-stone-900">{memoryProfile.visibility.tracked}</span>
+                      </div>
+                      <div className="flex items-center justify-between rounded-xl bg-stone-50 px-3 py-3">
+                        <span className="text-sm text-stone-600">{lang === 'en' ? 'Hidden notes' : 'Notas ocultas'}</span>
+                        <span className="font-mono text-sm font-bold text-stone-900">{memoryProfile.visibility.hidden}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="hidden">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-[10px] uppercase tracking-[0.3em] text-nobel/55">{lang === 'en' ? 'AI memory map' : 'Mapa da memÃ³ria da IA'}</p>
+                    <h3 className="mt-2 font-serif text-2xl font-bold">{lang === 'en' ? 'What the engine actually carries forward' : 'O que o motor realmente carrega adiante'}</h3>
+                    <p className="mt-3 max-w-2xl text-sm leading-7 text-stone-300">
+                      {lang === 'en' ? 'Global entries stay pinned in context. Tracked entries are recalled when names, aliases, or scene pressure match. Hidden entries remain in your archive only.' : 'Entradas globais ficam presas no contexto. Entradas rastreadas sÃ£o lembradas quando nomes, aliases ou a pressÃ£o da cena combinam. Entradas ocultas ficam sÃ³ no seu arquivo.'}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-white/10 bg-white/5 p-3">
+                    <Radar className="h-6 w-6 text-nobel" />
+                  </div>
+                </div>
+                <div className="mt-6 grid gap-3 md:grid-cols-3">
+                  <div className="rounded-2xl border border-amber-400/20 bg-amber-400/10 p-4">
+                    <p className="text-[10px] uppercase tracking-[0.24em] text-amber-200">Global</p>
+                    <p className="mt-2 font-serif text-3xl font-bold">{memoryProfile.visibility.global}</p>
+                    <p className="mt-2 text-sm leading-6 text-amber-100/80">{lang === 'en' ? 'Core anchors that always steer generation.' : 'Ã‚ncoras centrais que sempre orientam a geraÃ§Ã£o.'}</p>
+                  </div>
+                  <div className="rounded-2xl border border-sky-400/20 bg-sky-400/10 p-4">
+                    <p className="text-[10px] uppercase tracking-[0.24em] text-sky-200">{lang === 'en' ? 'Tracked' : 'Rastreado'}</p>
+                    <p className="mt-2 font-serif text-3xl font-bold">{memoryProfile.visibility.tracked}</p>
+                    <p className="mt-2 text-sm leading-6 text-sky-100/80">{lang === 'en' ? 'Detected by mention, alias, or narrative pressure.' : 'Detectado por menÃ§Ã£o, alias ou pressÃ£o narrativa.'}</p>
+                  </div>
+                  <div className="rounded-2xl border border-stone-400/20 bg-white/5 p-4">
+                    <p className="text-[10px] uppercase tracking-[0.24em] text-stone-300">{lang === 'en' ? 'Hidden' : 'Oculto'}</p>
+                    <p className="mt-2 font-serif text-3xl font-bold">{memoryProfile.visibility.hidden}</p>
+                    <p className="mt-2 text-sm leading-6 text-stone-300/80">{lang === 'en' ? 'Private notes that never enter AI context.' : 'Notas privadas que nunca entram no contexto da IA.'}</p>
+                  </div>
+                </div>
+              </div>
+              <div className="grid gap-4">
+                <div className="rounded-2xl border border-stone-200 bg-white p-5">
+                  <p className="text-[10px] uppercase tracking-[0.26em] text-stone-500">{lang === 'en' ? 'Codex map' : 'Mapa do codex'}</p>
+                  <div className="mt-3 space-y-3 text-sm leading-6 text-stone-600">
+                    <p><strong>{lang === 'en' ? 'Timeline' : 'Timeline'}:</strong> {lang === 'en' ? 'what happened, what is in motion, and what future pressure exists.' : 'o que aconteceu, o que está em movimento e que pressão futura existe.'}</p>
+                    <p><strong>{lang === 'en' ? 'Lore & Systems' : 'Lore & Sistemas'}:</strong> {lang === 'en' ? 'how the world works, what power costs, and what it cannot do.' : 'como o mundo funciona, quanto o poder custa e o que ele não pode fazer.'}</p>
+                  </div>
+                </div>
+                <div className="rounded-2xl border border-stone-200 bg-white p-5">
+                  <p className="text-[10px] uppercase tracking-[0.26em] text-stone-500">{lang === 'en' ? 'Tracker pulse' : 'Pulso do tracker'}</p>
+                  <div className="mt-4 space-y-3">
+                    <div className="flex items-center justify-between rounded-xl bg-stone-50 px-3 py-2.5">
+                      <span className="text-sm text-stone-500">{lang === 'en' ? 'Aliases enabled' : 'Aliases ativados'}</span>
+                      <span className="font-mono text-sm font-bold text-stone-900">{memoryProfile.trackedByAlias}</span>
+                    </div>
+                    <div className="flex items-center justify-between rounded-xl bg-stone-50 px-3 py-2.5">
+                      <span className="text-sm text-stone-500">{lang === 'en' ? 'Custom exclusions' : 'ExclusÃµes customizadas'}</span>
+                      <span className="font-mono text-sm font-bold text-stone-900">{memoryProfile.withExclusions}</span>
+                    </div>
+                    <div className="flex items-center justify-between rounded-xl bg-stone-50 px-3 py-2.5">
+                      <span className="text-sm text-stone-500">{lang === 'en' ? 'Open loops alive' : 'Loops em aberto'}</span>
+                      <span className="font-mono text-sm font-bold text-stone-900">{memoryProfile.openLoops}</span>
+                    </div>
+                    <div className="flex items-center justify-between rounded-xl bg-stone-50 px-3 py-2.5">
+                      <span className="text-sm text-stone-500">{lang === 'en' ? 'Active pressure events' : 'Eventos em pressÃ£o ativa'}</span>
+                      <span className="font-mono text-sm font-bold text-stone-900">{memoryProfile.activePressure}</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="rounded-2xl border border-stone-200 bg-stone-50 p-5">
+                  <p className="text-[10px] uppercase tracking-[0.26em] text-stone-500">{lang === 'en' ? 'Recommended use' : 'Uso recomendado'}</p>
+                  <div className="mt-3 space-y-3 text-sm leading-6 text-stone-600">
+                    <div className="flex items-start gap-3">
+                      <Globe2 className="mt-0.5 h-4 w-4 text-amber-600" />
+                      <p>{lang === 'en' ? 'Mark protagonist, central law, and non-negotiable faction truths as global.' : 'Marque protagonista, lei central e verdades de facÃ§Ã£o nÃ£o negociÃ¡veis como globais.'}</p>
+                    </div>
+                    <div className="flex items-start gap-3">
+                      <Search className="mt-0.5 h-4 w-4 text-sky-600" />
+                      <p>{lang === 'en' ? 'Leave side cast, recurring places, and episodic lore as tracked to keep prompts lean.' : 'Deixe elenco de apoio, locais recorrentes e lore episÃ³dico como rastreados para manter o prompt enxuto.'}</p>
+                    </div>
+                    <div className="flex items-start gap-3">
+                      <EyeOff className="mt-0.5 h-4 w-4 text-stone-500" />
+                      <p>{lang === 'en' ? 'Hide spoiler notes, draft theories, and material you do not want the engine acting on yet.' : 'Oculte notas com spoiler, teorias de rascunho e material que vocÃª ainda nÃ£o quer que o motor use.'}</p>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -600,10 +998,36 @@ export default function CodexView({ universe, onUpdateUniverse, initialSection =
             )}
           </SectionBlock>
 
-          <SimpleEntryGrid active={activeSection === 'laws'} id="laws" title={t('codex.section.lawsMagic')} icon={<Scale className="h-4 w-4" />} subtitle={t('codex.sectionSubtitle.laws')} entries={laws} addLabel={lang === 'en' ? 'New law' : 'Nova lei'} onAdd={() => openEntryEditor('rules', lang === 'en' ? 'New law or rule' : 'Nova lei ou regra')} onEdit={entry => openEntryEditor('rules', lang === 'en' ? 'Edit law or rule' : 'Editar lei ou regra', entry)} />
-          <SimpleEntryGrid active={activeSection === 'locations'} id="locations" title={t('codex.section.locations')} icon={<MapPin className="h-4 w-4" />} subtitle={t('codex.sectionSubtitle.locations')} entries={locations} addLabel={lang === 'en' ? 'New location' : 'Novo local'} onAdd={() => openEntryEditor('rules', lang === 'en' ? 'New location' : 'Novo local')} onEdit={entry => openEntryEditor('rules', lang === 'en' ? 'Edit location' : 'Editar local', entry)} />
+          <SectionBlock active={activeSection === 'systemsMagic'} id="systemsMagic" title={lang === 'en' ? 'Lore & Systems' : 'Lore & Sistemas'} icon={<Scale className="h-4 w-4" />} subtitle={lang === 'en' ? 'World rules and power logic.' : 'Regras do mundo e lógica do poder.'} count={systems.length + magic.length} action={<div className="flex flex-col items-stretch gap-2 md:items-end"><SegmentedToggle value={lawLens} onChange={value => setLawLens(value as 'systems' | 'magic')} options={[{ value: 'systems', label: lang === 'en' ? 'Systems' : 'Sistemas', meta: `${systems.length}` }, { value: 'magic', label: lang === 'en' ? 'Magic' : 'Magia', meta: `${magic.length}` }]} /><Button variant="ghost" size="sm" onClick={() => openEntryEditor('rules', lawLens === 'systems' ? (lang === 'en' ? 'New system' : 'Novo sistema') : (lang === 'en' ? 'New magic rule' : 'Nova regra de magia'), undefined, { ruleKind: lawLens === 'systems' ? 'system' : 'magic', aiVisibility: 'global' })}><Plus className="mr-2 h-3.5 w-3.5" />{lawLens === 'systems' ? (lang === 'en' ? 'Add system' : 'Adicionar sistema') : (lang === 'en' ? 'Add magic rule' : 'Adicionar magia')}</Button></div>}>
+            <div className="mb-5 flex flex-wrap items-center gap-2">
+              <span className={`rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] ${lawLens === 'systems' ? 'bg-amber-100 text-amber-800' : 'bg-sky-100 text-sky-800'}`}>
+                {lawLens === 'systems' ? (lang === 'en' ? 'Systems' : 'Sistemas') : (lang === 'en' ? 'Magic' : 'Magia')}
+              </span>
+              <span className="rounded-full bg-stone-100 px-3 py-1 text-[11px] font-semibold text-stone-600">
+                {lawLens === 'systems'
+                  ? (lang === 'en' ? `${systems.length} entries` : `${systems.length} entradas`)
+                  : (lang === 'en' ? `${magic.length} entries` : `${magic.length} entradas`)}
+              </span>
+            </div>
+            <EntryCollectionPanel title={lawLens === 'systems' ? (lang === 'en' ? 'Systems' : 'Sistemas') : (lang === 'en' ? 'Magic & Powers' : 'Magia & Poderes')} subtitle={lawLens === 'systems' ? (lang === 'en' ? 'Operational rules, institutions, and constraints that keep the setting coherent.' : 'Regras operacionais, instituições e restrições que mantêm o cenário coerente.') : (lang === 'en' ? 'Source, cost, limit, access, and danger of supernatural or exceptional force.' : 'Fonte, custo, limite, acesso e perigo da força sobrenatural ou excepcional.')} entries={activeLawEntries} addLabel={lawLens === 'systems' ? (lang === 'en' ? 'New system' : 'Novo sistema') : (lang === 'en' ? 'New magic rule' : 'Nova regra de magia')} onAdd={() => openEntryEditor('rules', lawLens === 'systems' ? (lang === 'en' ? 'New system' : 'Novo sistema') : (lang === 'en' ? 'New magic rule' : 'Nova regra de magia'), undefined, { ruleKind: lawLens === 'systems' ? 'system' : 'magic', aiVisibility: 'global' })} onEdit={entry => openEntryEditor('rules', lawLens === 'systems' ? (lang === 'en' ? 'Edit system' : 'Editar sistema') : (lang === 'en' ? 'Edit magic rule' : 'Editar regra de magia'), entry)} emptyTitle={lawLens === 'systems' ? (lang === 'en' ? 'No systems yet' : 'Nenhum sistema ainda') : (lang === 'en' ? 'No magic rules yet' : 'Nenhuma regra de magia ainda')} emptyBody={lawLens === 'systems' ? (lang === 'en' ? 'Start with one hard rule the world cannot ignore.' : 'Comece com uma regra dura que o mundo não pode ignorar.') : (lang === 'en' ? 'Start with the source of power and its cost.' : 'Comece pela fonte do poder e seu custo.')} accent={lawLens === 'systems' ? 'amber' : 'sky'} />
+          </SectionBlock>
+          <SimpleEntryGrid active={activeSection === 'locations'} id="locations" title={t('codex.section.locations')} icon={<MapPin className="h-4 w-4" />} subtitle={t('codex.sectionSubtitle.locations')} entries={locations} addLabel={lang === 'en' ? 'New location' : 'Novo local'} onAdd={() => openEntryEditor('rules', lang === 'en' ? 'New location' : 'Novo local', undefined, { ruleKind: 'location', aiVisibility: 'tracked' })} onEdit={entry => openEntryEditor('rules', lang === 'en' ? 'Edit location' : 'Editar local', entry)} />
 
-          <SectionBlock active={activeSection === 'timeline'} id="timeline" title={t('codex.section.timeline')} icon={<Clock className="h-4 w-4" />} subtitle={t('codex.sectionSubtitle.timeline')} count={timeline.length} action={<Button variant="ghost" size="sm" onClick={() => openEntryEditor('timeline', lang === 'en' ? 'New event' : 'Novo evento')}><Plus className="mr-2 h-3.5 w-3.5" />{lang === 'en' ? 'New event' : 'Novo evento'}</Button>}>
+          <SectionBlock active={activeSection === 'timeline'} id="timeline" title={t('codex.section.timeline')} icon={<Clock className="h-4 w-4" />} subtitle={lang === 'en' ? 'Events now carry state, impact, scope, and anchor characters for better memory.' : 'Eventos agora carregam estado, impacto, escopo e personagens âncora para melhorar a memória.'} count={timeline.length} action={<Button variant="ghost" size="sm" onClick={() => openEntryEditor('timeline', lang === 'en' ? 'New event' : 'Novo evento')}><Plus className="mr-2 h-3.5 w-3.5" />{lang === 'en' ? 'New event' : 'Novo evento'}</Button>}>
+            <div className="mb-5 grid gap-4 lg:grid-cols-3">
+              <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4">
+                <p className="text-[10px] uppercase tracking-[0.22em] text-stone-500">{lang === 'en' ? 'Impact' : 'Impacto'}</p>
+                <p className="mt-2 text-sm leading-6 text-stone-600">{lang === 'en' ? 'How violently this event bends the story.' : 'Quão violentamente esse evento entorta a história.'}</p>
+              </div>
+              <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4">
+                <p className="text-[10px] uppercase tracking-[0.22em] text-stone-500">{lang === 'en' ? 'Scope' : 'Escopo'}</p>
+                <p className="mt-2 text-sm leading-6 text-stone-600">{lang === 'en' ? 'Whether it hits one life, one place, one faction, or the whole world.' : 'Se atinge uma vida, um lugar, uma facção ou o mundo inteiro.'}</p>
+              </div>
+              <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4">
+                <p className="text-[10px] uppercase tracking-[0.22em] text-stone-500">{lang === 'en' ? 'Anchors' : 'Âncoras'}</p>
+                <p className="mt-2 text-sm leading-6 text-stone-600">{lang === 'en' ? 'Tie events to characters so the engine knows whose arc they pressure.' : 'Prenda eventos a personagens para o motor saber em que arco essa pressão cai.'}</p>
+              </div>
+            </div>
             {timeline.length === 0 ? (
               <p className="text-sm italic text-stone-400">{t('codex.empty.events')}</p>
             ) : (
@@ -623,6 +1047,8 @@ export default function CodexView({ universe, onUpdateUniverse, initialSection =
                             <div className="mt-2 flex flex-wrap gap-2">
                               {entry.eventState && <span className="rounded-full bg-stone-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-stone-600">{entry.eventState}</span>}
                               {entry.discoveryKind && <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-800">{entry.discoveryKind}</span>}
+                              {entry.timelineImpact && <span className="rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-rose-700">{timelineImpactLabel(entry.timelineImpact, lang)}</span>}
+                              {entry.timelineScope && <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-violet-700">{timelineScopeLabel(entry.timelineScope, lang)}</span>}
                               {(entry.relatedEntityIds?.length ?? 0) > 0 && <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-blue-700">{entry.relatedEntityIds?.length} {t('codex.label.links')}</span>}
                             </div>
                           </div>
@@ -632,6 +1058,9 @@ export default function CodexView({ universe, onUpdateUniverse, initialSection =
                         {(entry.relatedEntityIds?.length ?? 0) > 0 && (
                           <p className="mt-3 text-xs text-stone-400">{t('codex.label.relatedTo')}: {relatedEntityLabels(entry.relatedEntityIds)}</p>
                         )}
+                        {(entry.anchorCharacterIds?.length ?? 0) > 0 && (
+                          <p className="mt-2 text-xs text-stone-400">{lang === 'en' ? 'Anchor characters' : 'Personagens âncora'}: {entry.anchorCharacterIds?.map(id => characterCatalog.find(item => item.id === id)?.label).filter(Boolean).join(', ')}</p>
+                        )}
                       </div>
                     </motion.div>
                   ))}
@@ -640,7 +1069,8 @@ export default function CodexView({ universe, onUpdateUniverse, initialSection =
             )}
           </SectionBlock>
 
-          <SimpleEntryGrid active={activeSection === 'lore'} id="lore" title={t('codex.section.loreConcepts')} icon={<Sparkles className="h-4 w-4" />} subtitle={t('codex.sectionSubtitle.lore')} entries={lore} addLabel={lang === 'en' ? 'New concept' : 'Novo conceito'} onAdd={() => openEntryEditor('rules', lang === 'en' ? 'New concept' : 'Novo conceito')} onEdit={entry => openEntryEditor('rules', lang === 'en' ? 'Edit concept' : 'Editar conceito', entry)} />
+          
+
         </main>
       </div>
 
@@ -667,6 +1097,7 @@ export default function CodexView({ universe, onUpdateUniverse, initialSection =
           aliases: aliasString(entryEditor?.entry?.aliases ?? []),
           content: entryEditor?.entry?.content ?? '',
           notesPrivate: entryEditor?.entry?.notesPrivate ?? '',
+          ruleKind: entryEditor?.entry?.ruleKind ?? 'system',
           aiVisibility: entryEditor?.entry?.aiVisibility ?? 'tracked',
           trackByAlias: entryEditor?.entry?.tracking?.trackByAlias ?? true,
           caseSensitive: entryEditor?.entry?.tracking?.caseSensitive ?? false,
@@ -677,7 +1108,10 @@ export default function CodexView({ universe, onUpdateUniverse, initialSection =
           truthNeedsReview: entryEditor?.entry?.truth?.needsReview ?? false,
           eventState: entryEditor?.entry?.eventState ?? 'historical',
           discoveryKind: entryEditor?.entry?.discoveryKind ?? 'past_occurrence',
+          timelineImpact: entryEditor?.entry?.timelineImpact ?? 'medium',
+          timelineScope: entryEditor?.entry?.timelineScope ?? 'personal',
           relatedEntities: relatedEntityLabels(entryEditor?.entry?.relatedEntityIds),
+          anchorCharacters: entryEditor?.entry?.anchorCharacterIds?.map(id => characterCatalog.find(item => item.id === id)?.label).filter(Boolean).join(', ') ?? '',
         }}
         mentions={entryMentions}
         onClose={() => setEntryEditor(null)}
@@ -716,7 +1150,7 @@ const FactionAccordion = ({ entry, index, palette, onEdit }: { entry: CodexEntry
 };
 
 const SimpleEntryGrid = ({ id, title, icon, subtitle, entries, addLabel, onAdd, onEdit, active = true }: { id: string; title: string; icon: React.ReactNode; subtitle: string; entries: CodexEntry[]; addLabel: string; onAdd: () => void; onEdit: (entry: CodexEntry) => void; active?: boolean }) => {
-  const { t } = useLanguage();
+  const { t, lang } = useLanguage();
   return (
   <SectionBlock active={active} id={id} title={title} icon={icon} subtitle={subtitle} count={entries.length} action={<Button variant="ghost" size="sm" onClick={onAdd}><Plus className="mr-2 h-3.5 w-3.5" />{addLabel}</Button>}>
     {entries.length === 0 ? (
@@ -729,6 +1163,7 @@ const SimpleEntryGrid = ({ id, title, icon, subtitle, entries, addLabel, onAdd, 
               <div>
                 <p className="font-serif text-lg font-bold text-stone-900">{entry.title}</p>
                 {entry.aliases.length > 0 && <p className="mt-1 text-xs text-stone-400">{t('codex.label.aliases')}: {aliasString(entry.aliases)}</p>}
+                {entry.ruleKind && <span className="mt-2 inline-flex rounded-full bg-stone-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-stone-600">{ruleKindLabel(entry.ruleKind, lang)}</span>}
               </div>
               <button className="text-stone-400 hover:text-stone-700" onClick={() => onEdit(entry)}><Edit3 className="h-4 w-4" /></button>
             </div>

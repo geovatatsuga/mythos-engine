@@ -13,10 +13,17 @@ import Toast from './components/ui/Toast';
 import LandingPage from './components/LandingPage';
 import AgentThinkingPanel from './components/ui/AgentThinkingPanel';
 import ApiKeyModal from './components/ui/ApiKeyModal';
+import ErrorBoundary, { type BoundaryErrorDetails } from './components/ui/ErrorBoundary';
 import { generateDivineGenesis, createNewUniverse, generateCharacter, generateImage, generateStoryArc, syncUniverseCanon } from './services/geminiService';
 import type { AutogenProgress } from './services/geminiService';
 import { createPortraitUrl } from './utils/portraits';
 import { EMPTY_API_KEYS, hasAllApiKeys, loadApiKeys, saveApiKeys } from './utils/apiKeys';
+
+interface RuntimeIssue {
+  source: 'render' | 'window' | 'promise' | 'agent-panel';
+  message: string;
+  stack?: string;
+}
 
 export default function App() {
   const [hasStarted, setHasStarted] = useState(false);
@@ -28,11 +35,49 @@ export default function App() {
   const [genesisStep, setGenesisStep] = useState<GenerationStep>('idle');
   const [toast, setToast] = useState<ToastMessage | null>(null);
   const [autoGenProgress, setAutoGenProgress] = useState<AutogenProgress | null>(null);
+  const [runtimeIssue, setRuntimeIssue] = useState<RuntimeIssue | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const apiKeysReady = hasAllApiKeys(apiKeys);
 
   useEffect(() => {
     setApiKeys(loadApiKeys() || EMPTY_API_KEYS);
+  }, []);
+
+  useEffect(() => {
+    const handleWindowError = (event: ErrorEvent) => {
+      const message = event.error instanceof Error
+        ? event.error.message
+        : event.message || 'Erro síncrono em tempo de execução';
+
+      setRuntimeIssue({
+        source: 'window',
+        message,
+        stack: event.error instanceof Error ? event.error.stack : undefined,
+      });
+    };
+
+    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
+      const reason = event.reason;
+      const message = reason instanceof Error
+        ? reason.message
+        : typeof reason === 'string'
+          ? reason
+          : 'Promise rejeitada sem tratamento';
+
+      setRuntimeIssue({
+        source: 'promise',
+        message,
+        stack: reason instanceof Error ? reason.stack : undefined,
+      });
+    };
+
+    window.addEventListener('error', handleWindowError);
+    window.addEventListener('unhandledrejection', handleUnhandledRejection);
+
+    return () => {
+      window.removeEventListener('error', handleWindowError);
+      window.removeEventListener('unhandledrejection', handleUnhandledRejection);
+    };
   }, []);
 
   const handleStartRequest = useCallback(() => {
@@ -299,6 +344,21 @@ export default function App() {
     }
   };
 
+  const handleBoundaryError = useCallback((details: BoundaryErrorDetails, source: RuntimeIssue['source']) => {
+    setRuntimeIssue({
+      source,
+      message: details.error.message,
+      stack: details.error.stack || details.componentStack,
+    });
+  }, []);
+
+  const runtimeSourceLabel: Record<RuntimeIssue['source'], string> = {
+    render: 'Erro de renderização',
+    window: 'Erro de script',
+    promise: 'Promise sem tratamento',
+    'agent-panel': 'Painel de agentes',
+  };
+
   return (
     <LanguageProvider>
       {!hasStarted ? (
@@ -318,11 +378,57 @@ export default function App() {
       ) : (
         <div className="flex h-screen bg-background text-text font-sans">
           <Sidebar currentView={currentView} setCurrentView={setCurrentView} universeExists={!!universe} />
-          <main className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8 bg-paper">
-            {renderContent()}
-          </main>
+          <ErrorBoundary
+            onError={(details) => handleBoundaryError(details, 'render')}
+            fallback={(details) => (
+              <main className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8 bg-paper">
+                <div className="mx-auto max-w-4xl rounded-2xl border border-red-200 bg-red-50 p-6 text-red-950 shadow-sm">
+                  <p className="text-xs font-bold uppercase tracking-[0.24em] text-red-500">Erro de renderização</p>
+                  <h1 className="mt-2 font-serif text-3xl font-bold">A interface quebrou, mas o erro agora está visível</h1>
+                  <p className="mt-3 text-sm text-red-900">{details.error.message}</p>
+                  {(details.error.stack || details.componentStack) && (
+                    <pre className="mt-4 max-h-[50vh] overflow-auto rounded-xl bg-white/80 p-4 text-xs whitespace-pre-wrap text-red-950">
+                      {details.error.stack || details.componentStack}
+                    </pre>
+                  )}
+                </div>
+              </main>
+            )}
+          >
+            <main className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8 bg-paper">
+              {renderContent()}
+            </main>
+          </ErrorBoundary>
           {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
-          <AgentThinkingPanel />
+          <ErrorBoundary
+            onError={(details) => handleBoundaryError(details, 'agent-panel')}
+            fallback={null}
+          >
+            <AgentThinkingPanel />
+          </ErrorBoundary>
+          {runtimeIssue && (
+            <div className="fixed left-4 top-4 z-[60] max-w-xl rounded-2xl border border-red-200 bg-red-50/95 p-4 text-red-950 shadow-2xl backdrop-blur">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="text-[11px] font-bold uppercase tracking-[0.24em] text-red-500">
+                    {runtimeSourceLabel[runtimeIssue.source]}
+                  </p>
+                  <p className="mt-1 text-sm font-semibold">{runtimeIssue.message}</p>
+                </div>
+                <button
+                  onClick={() => setRuntimeIssue(null)}
+                  className="rounded-md border border-red-200 bg-white px-2 py-1 text-xs text-red-700 hover:bg-red-100"
+                >
+                  Fechar
+                </button>
+              </div>
+              {runtimeIssue.stack && (
+                <pre className="mt-3 max-h-40 overflow-auto rounded-xl bg-white/80 p-3 text-xs whitespace-pre-wrap text-red-950">
+                  {runtimeIssue.stack}
+                </pre>
+              )}
+            </div>
+          )}
         </div>
       )}
     </LanguageProvider>

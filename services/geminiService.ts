@@ -6,7 +6,7 @@ import type {
     ChapterGenerationParams, CodexEntry, StoryProfile, StoryFormat,
     NarrativeMemory, CharacterState, OpenLoop, OpeningStyle, ArbiterIssue,
     TokenUsageEvent, AgentOutputEvent, AgentOutputStatus, WeaverPlan, GenerationQualityMode,
-    DirectorGuidance, AIVisibility, DirtyScope, SyncMeta, TrackingConfig, TruthBundle, CharacterLieState, TimelineEventState, TimelineDiscoveryKind,
+    DirectorGuidance, AIVisibility, DirtyScope, SyncMeta, TrackingConfig, TruthBundle, CharacterLieState, TimelineEventState, TimelineDiscoveryKind, RuleEntryKind, TimelineImpact, TimelineScope,
 } from '../types';
 import { DEFAULT_AGENTS } from '../constants';
 import { createPortraitUrl } from '../utils/portraits';
@@ -67,6 +67,7 @@ const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-2.0-f
 // ─── Cerebras — OpenAI-compatible endpoint (free tier) ─────────────────────
 const CEREBRAS_BASE_URL = 'https://api.cerebras.ai/v1';
 const CEREBRAS_DEFAULT_MODEL = process.env.CEREBRAS_MODEL || 'qwen-3-235b-a22b-instruct-2507';
+const BARD_CEREBRAS_MODEL = process.env.BARD_CEREBRAS_MODEL || 'qwen-3-235b-a22b-instruct-2507';
 const CEREBRAS_LAST_RESORT = 'llama3.1-8b'; // absolute last fallback (free tier 8B)
 const CEREBRAS_GPT_OSS_MODELS = new Set(['gpt-oss-120b', 'gpt-oss-20b']);
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
@@ -198,6 +199,30 @@ const inferTimelineDiscoveryKind = (title: string, content: string): TimelineDis
     return 'past_occurrence';
 };
 
+const inferRuleEntryKind = (title: string, content: string): RuleEntryKind => {
+    const blob = normalizeTitle(`${title} ${content}`);
+    if (/(bairro|torre|templo|cidade|reino|fortaleza|palacio|palácio|porto|floresta|ruina|ruína|distrito|megacidade|district|tower|temple|city|kingdom|forest|hall|passagem|passage)/.test(blob)) return 'location';
+    if (/(magia|magic|spell|mana|arcano|arcane|ritual de poder|grimorio|grimoire|feiti|poder|ability|gift|curse system|source of power)/.test(blob)) return 'magic';
+    if (/(mito|myth|lenda|legend|cosmologia|cosmology|religiao|religião|folk|folclore|propaganda|rumor|origem do mundo|deuses|gods)/.test(blob)) return 'lore';
+    return 'system';
+};
+
+const inferTimelineImpact = (title: string, content: string): TimelineImpact => {
+    const blob = normalizeTitle(`${title} ${content}`);
+    if (/(apocalipse|world-ending|cataclism|cataclismo|extin|ruina total|queda do imperio|fall of the empire)/.test(blob)) return 'cataclysmic';
+    if (/(guerra|war|massacre|rebeli|rebellion|assassinat|coup|ritual major|ritual maior)/.test(blob)) return 'high';
+    if (/(revela|discovery|descoberta|juramento|oath|pacto|fuga|escape|capture|captura)/.test(blob)) return 'medium';
+    return 'low';
+};
+
+const inferTimelineScope = (title: string, content: string): TimelineScope => {
+    const blob = normalizeTitle(`${title} ${content}`);
+    if (/(mundo|world|imperio|empire|all realms|todos os reinos|cosmos|reino inteiro)/.test(blob)) return 'world';
+    if (/(fac[cç][aã]o|faction|house|guild|cult|ordem|clan|clã)/.test(blob)) return 'faction';
+    if (/(cidade|city|hall|bairro|district|temple|palace|palacio|palácio|fortress|fortaleza)/.test(blob)) return 'local';
+    return 'personal';
+};
+
 const inferRelatedEntityIds = (universe: Universe, text: string, excludeId?: string): string[] => {
     const prepared = ensureUniverseDefaults(universe);
     const pools: Array<{ id: string; name: string; aliases: string[]; tracking?: TrackingConfig }> = [
@@ -224,10 +249,14 @@ const ensureCodexEntryDefaults = (entry: CodexEntry): CodexEntry => ({
         exclusions: normalizeAliasList(entry.tracking?.exclusions),
     },
     truth: entry.truth ?? createTruthBundle(entry.id || generateId(), entry.content),
+    ruleKind: entry.ruleKind ?? inferRuleEntryKind(entry.title, entry.content),
     relatedEntityIds: entry.relatedEntityIds ?? [],
+    anchorCharacterIds: entry.anchorCharacterIds ?? [],
     dependsOnIds: entry.dependsOnIds ?? [],
     eventState: entry.eventState,
     discoveryKind: entry.discoveryKind,
+    timelineImpact: entry.timelineImpact ?? (entry.eventState ? inferTimelineImpact(entry.title, entry.content) : undefined),
+    timelineScope: entry.timelineScope ?? (entry.eventState ? inferTimelineScope(entry.title, entry.content) : undefined),
 });
 
 const ensureCharacterDefaults = (character: Character): Character => ({
@@ -286,10 +315,24 @@ const COMPACT_AGENT_PROMPTS: Partial<Record<string, string>> = {
     soulforger: 'Create psychologically coherent characters with a Ghost and a Lie. Keep the protagonist active and concrete.',
     director: 'Analyse narrative health: open loops, faction balance, protagonist agency. Issue per-chapter guidance JSON only.',
     weaver: 'Plan 5-7 causal beats. Each beat must include actor, action, obstacle, and consequence. Avoid textbook plot labels and generic screenplay scaffolding. Output structured JSON only.',
-    bard: 'Write continuous narrative prose only. No headers or meta text. Start concrete, maintain POV, dramatize actions, avoid repetition or cliches, and vary sentence temperature between clean action, sensory detail, and only occasional high-intensity lines.',
+    bard: 'Write continuous narrative prose only. No headers or meta text. Start concrete, maintain POV, dramatize actions, avoid repetition or cliches, vary sentence temperature, forbid filtering ("he felt/he knew/he saw"), avoid "parecia/como se" except when indispensable, and default to affirmative syntax instead of contrastive negation.',
     chronicler: 'Extract explicit facts into the requested JSON only. Reuse known character IDs, avoid invention, and only record stable codex facts.',
-    lector: 'Polish the chapter with minimal edits. Remove repetition and banned phrases without shrinking the chapter materially.',
+    lector: 'Polish the chapter with minimal edits. Prefer concrete nouns, physical verbs, direct syntax, and lower-temperature phrasing. Remove repetition, filtering, hedged similes, and banned rhetoric without making the prose more dramatic.',
 };
+
+const BARD_STYLE_OVERRIDE = `
+
+FILTERING / HESITATION BAN:
+- Do NOT habitually frame prose through "ele sabia", "ele sentiu", "ele percebeu", "ele notou", "ele viu", "ele ouviu", "ela sabia", "ela sentiu", or equivalent English forms.
+- Only use a perception verb if the act of perception itself changes the scene.
+- Do NOT lean on "parecia", "como se", "as if", or "seemed" as default atmosphere generators. One rare use in a long chapter is acceptable; repeated use is failure.
+- Prefer concrete assertion over hedged image.
+
+WEAK GLUE WORDS:
+- Do NOT use "mas", "não", "apenas", "só", "quase" as rhythmic crutches in consecutive sentences.
+- If you need force, cut the sentence or sharpen the verb. Do not simulate intensity with connective negation.
+- Prefer affirmative syntax and concrete sequence over explanatory contrast.
+`;
 
 // ─── Story Profile Helpers ──────────────────────────────────────────────────
 
@@ -970,13 +1013,17 @@ const buildImagePlaceholder = (prompt: string, label: string): string => {
 // ─── Agent prompt & context builders ────────────────────────────────────────
 
 const getAgentPrompt = (universe: Universe | null, agentId: string, compact = false): string => {
-    if (compact && COMPACT_AGENT_PROMPTS[agentId]) {
-        return COMPACT_AGENT_PROMPTS[agentId] as string;
+    const basePrompt = compact && COMPACT_AGENT_PROMPTS[agentId]
+        ? COMPACT_AGENT_PROMPTS[agentId] as string
+        : universe && universe.agentConfigs && universe.agentConfigs[agentId]
+        ? universe.agentConfigs[agentId].systemPrompt
+        : DEFAULT_AGENTS[agentId]?.systemPrompt || 'You are a helpful AI assistant.';
+
+    if (agentId === 'bard') {
+        return `${basePrompt}${BARD_STYLE_OVERRIDE}`;
     }
-    if (universe && universe.agentConfigs && universe.agentConfigs[agentId]) {
-        return universe.agentConfigs[agentId].systemPrompt;
-    }
-    return DEFAULT_AGENTS[agentId]?.systemPrompt || 'You are a helpful AI assistant.';
+
+    return basePrompt;
 };
 
 const isVisibleToAI = (visibility?: AIVisibility): boolean => (visibility ?? DEFAULT_AI_VISIBILITY) !== 'hidden';
@@ -1046,11 +1093,11 @@ const buildUniverseContext = (
     --- KEY FACTIONS ---
     ${factions.map(f => `- ${f.title}${formatAliasesInline(f.aliases)}: ${truncateText(f.content, compact ? 120 : 240)}`).join('\n') || '- None recorded.'}
 
-    --- WORLD RULES & MAGIC ---
-    ${rules.map(r => `- ${r.title}${formatAliasesInline(r.aliases)}: ${truncateText(r.content, compact ? 120 : 240)}`).join('\n') || '- None recorded.'}
+    --- WORLD SYSTEMS / MAGIC / LORE ---
+    ${rules.map(r => `- ${r.title}${formatAliasesInline(r.aliases)} [${r.ruleKind ?? inferRuleEntryKind(r.title, r.content)}]: ${truncateText(r.content, compact ? 120 : 240)}`).join('\n') || '- None recorded.'}
 
     --- TIMELINE ---
-    ${timeline.map(t => `- ${t.title}${formatAliasesInline(t.aliases)} [${t.eventState ?? 'historical'}${t.discoveryKind ? ` / ${t.discoveryKind}` : ''}]: ${truncateText(t.content, compact ? 120 : 240)}`).join('\n') || '- None recorded.'}
+    ${timeline.map(t => `- ${t.title}${formatAliasesInline(t.aliases)} [${t.eventState ?? 'historical'}${t.discoveryKind ? ` / ${t.discoveryKind}` : ''}${t.timelineImpact ? ` / impact:${t.timelineImpact}` : ''}${t.timelineScope ? ` / scope:${t.timelineScope}` : ''}]: ${truncateText(t.content, compact ? 120 : 240)}`).join('\n') || '- None recorded.'}
     `;
 };
 
@@ -1865,7 +1912,7 @@ export const generateFullUniverseGenesis = async (
     onProgress('characters');
     emitAgentOutput({ agent: 'soulforger', label: 'Soulforger · Protagonista', status: 'thinking' });
     const soulforgerPrompt = getAgentPrompt(uni, 'soulforger', compactMode);
-    const factionsList = uni.codex.factions.map(f => f.title).join(', ') || 'Independent';
+    const factionsList = uni.codex.factions.map(f => f.title).join(', ');
     const protData = await chatJson<{
         name?: string;
         aliases?: string[];
@@ -1933,7 +1980,7 @@ export const generateFullUniverseGenesis = async (
         name: protName,
         aliases: normalizeAliasList(protData.aliases),
         role: protData.role || 'Protagonista',
-        faction: protData.faction || factionsList.split(',')[0] || 'Unknown',
+        faction: (protData.faction || '').trim(),
         age: protData.age || 25,
         alignment: protData.alignment || 'N/A',
         bio: protData.bio || (effectiveLang === 'en' ? 'A mysterious figure.' : 'Uma figura misteriosa.'),
@@ -1948,7 +1995,7 @@ export const generateFullUniverseGenesis = async (
         imageUrl: createPortraitUrl({
             name: protName,
             role: protData.role || 'Protagonista',
-            faction: protData.faction || factionsList.split(',')[0] || 'Unknown',
+            faction: (protData.faction || '').trim(),
             seed: `${protName}|${protData.bio || ''}`,
             size: 768,
         }),
@@ -2318,10 +2365,11 @@ Write a single flowing arc passage (180–350 words). Rules:
             system: bardPrompt,
             user: arcUser,
             json: false,
+            model: BARD_CEREBRAS_MODEL,
             temperature: 0.8,
             maxTokens: compactMode ? 900 : 1400,
             label: 'Bard · Arc',
-            provider: 'groq',
+            provider: 'cerebras',
         });
         arcModeProse = stripLLMPrefixes(arcModeProse);
         arcModeProse = cleanLanguageLeakage(arcModeProse, params.lang ?? universe.lang ?? 'pt');
@@ -2474,6 +2522,25 @@ ${nameVariationMandate}
 - ALSO FORBIDDEN: chains of negation used to simulate profundity, such as "não humana. não animal.", "não era linguagem. era ritual.", "não por medo. por certeza."
 - Default to affirmative syntax. Name what is there before naming what it is not.
 
+=== FILTERING & HESITATION BAN — MANDATORY ===
+- Remove narrative filters unless the act of perception itself is the event.
+- FORBIDDEN as habitual framing: "ele sentiu", "ele sabia", "ele percebeu", "ele notou", "ele viu", "ele ouviu", "ele pensou", "ele observou", "ela sentiu", "ela sabia", and equivalent English forms.
+- Bad: "Ele sentiu o peso da decisão." Better: "A decisão pesou nos ombros."
+- Bad: "Ele sabia que o inimigo estava lá." Better: "O inimigo o esperava na penumbra."
+- The reader should touch the scene directly, not through explanatory wrappers.
+
+=== SIMILE / 'PARECIA' CONTROL — MANDATORY ===
+- Do NOT use "parecia", "como se", "as if", or "seemed" as default atmosphere generators.
+- One isolated use in a long chapter is acceptable; repeated use is a failure.
+- Prefer concrete assertion over hedged image.
+- Bad: "o metal se contorceu como se respirasse." Better: "o metal se contorceu, respirando sob a pressão."
+- Bad: "a estrutura parecia viva." Better: "a estrutura pulsava sob as placas."
+
+=== WEAK EMPHASIS WORDS — COOLDOWN ===
+- Avoid leaning on "mas", "não", "apenas", "só", "ainda", "quase" as sentence crutches for false intensity.
+- If contrast is needed, create it through action and consequence, not connective glue.
+- If minimalism is needed, cut the sentence rather than inserting "apenas".
+
 === LENGTH MANDATE & MICRO-PACING ===
 - Write ALL ${plan.scenes?.length || 5} beats fully — do not summarize or skip any.
 - TARGET LENGTH: at least ${targetMinChars} characters unless every beat has already been fully dramatized.
@@ -2503,9 +2570,11 @@ STYLE: ${params.tone}. FOCUS: ${params.focus}.
         system: bardPrompt,
         user: bardInput,
         json: false,
+        model: BARD_CEREBRAS_MODEL,
         temperature: 0.88,
         maxTokens: compactMode ? 4400 : 5200,
         label: 'Bard · Escrita',
+        provider: 'cerebras',
     });
 
     prose = stripLLMPrefixes(prose);
@@ -2520,9 +2589,11 @@ STYLE: ${params.tone}. FOCUS: ${params.focus}.
 
 CRITICAL REVISION TASK: Expand the chapter below so it fully dramatizes every planned beat. Keep the same events, but add missing environment, physical action, transitions, and consequences until the text reaches at least ${targetMinChars} characters. Return the FULL rewritten chapter, not just the added part.\n\nCURRENT CHAPTER:\n${prose}`,
             json: false,
+            model: BARD_CEREBRAS_MODEL,
             temperature: 0.82,
             maxTokens: compactMode ? 4400 : 5200,
             label: compactMode ? 'Bard · Retry' : 'Bard · Expand',
+            provider: 'cerebras',
         });
         expansionProse = stripLLMPrefixes(expansionProse);
         expansionProse = cleanLanguageLeakage(expansionProse, params.lang ?? universe.lang ?? 'pt');
@@ -2585,6 +2656,14 @@ RULES:
 - Only flag issues that are CLEARLY present: word overuse (same non-article word 4+ times), POV drift, passive protagonist.
 - Detect rhetorical crutches: repeated contrastive-negation molds such as "não X, mas Y", "não era..., mas...", "em vez disso", "not X, but Y".
 - Detect tonal monotony: if too many consecutive sentences sound maximally solemn, aphoristic, or trailer-like, prefer cleaner and more direct replacements.
+- Detect narrative filtering and hedged atmosphere: "ele sentiu", "ele sabia", "ele percebeu", "ele viu", "parecia", "como se", "as if", "seemed".
+- Your replacements must REDUCE inflation, not increase it.
+- Prefer concrete nouns, physical verbs, direct syntax, and lower-temperature phrasing.
+- Never replace a simple phrase with a more ornate one. If in doubt, simplify.
+- Bad correction: "sentiu um leve arrepio" -> "uma onda de alerta percorreu sua espinha".
+- Good correction: "sentiu um leve arrepio" -> "um arrepio correu pela nuca".
+- Good correction: "ele sabia que precisava agir" -> "precisava agir".
+- Good correction: "o metal parecia vivo" -> "o metal pulsava".
 - Do NOT alter plot, names, or story facts.
 - Do NOT return a replacement if you are not 100% sure the "find" string appears verbatim.
 - "sceneObjectiveCheck": "ok" if the protagonist actively drives each scene, "complicado" if they are passive in 1-2 scenes, "falhou" if passive throughout.`,
@@ -2626,7 +2705,7 @@ Return ONLY valid JSON matching this exact schema:
     finalProse = applyLectorReplacements(prose, lectorAudit.replacements ?? []);
     // Safety: if result shrank dramatically, fall back to original
     if (finalProse.length < prose.length * 0.92) finalProse = prose;
-    if ((lectorAudit.rhetoricalPatternCount ?? 0) >= 3 && !compactMode) {
+    if ((lectorAudit.rhetoricalPatternCount ?? 0) >= 2 && !compactMode) {
         emitAgentOutput({ agent: 'bard', label: 'Bard rhetorical rewrite', status: 'thinking' });
         let rewrittenProse = await chat({
             system: bardPrompt,
@@ -2644,9 +2723,11 @@ The Lector flagged heavy overuse of contrastive-negation rhetoric in the chapter
 CHAPTER TO FIX:
 ${finalProse}`,
             json: false,
+            model: BARD_CEREBRAS_MODEL,
             temperature: 0.7,
             maxTokens: 5200,
             label: 'Bard rhetorical rewrite',
+            provider: 'cerebras',
         });
         rewrittenProse = stripLLMPrefixes(rewrittenProse);
         rewrittenProse = cleanLanguageLeakage(rewrittenProse, params.lang ?? universe.lang ?? 'pt');
@@ -2692,9 +2773,11 @@ ${protagonistName} is observing, following or waiting in scenes instead of drivi
 CHAPTER TO FIX:
 ${finalProse}`,
             json: false,
+            model: BARD_CEREBRAS_MODEL,
             temperature: 0.75,
             maxTokens: 5200,
             label: 'Bard · Reescrita Ativa',
+            provider: 'cerebras',
         });
         rewrittenProse = stripLLMPrefixes(rewrittenProse);
         rewrittenProse = cleanLanguageLeakage(rewrittenProse, params.lang ?? universe.lang ?? 'pt');
@@ -3305,6 +3388,28 @@ const applyChroniclerSideEffects = (
     chapterIndex: number,
     chapterId: string,
 ): Universe => {
+    const normalizedOutput: ChroniclerOutput = (() => {
+        const existingTimeline = output.newCodex?.timeline ?? [];
+        if (existingTimeline.length > 0) return output;
+        const summary = output.summary?.trim() || '';
+        const recentEvents = (output.recentEvents || []).map(event => event.trim()).filter(Boolean);
+        if (!summary && recentEvents.length === 0) return output;
+
+        const titleSeed = recentEvents[0] || summary.split(/[.!?]/)[0] || `CapÃ­tulo ${chapterIndex + 1}`;
+        const timelineTitle = truncateText(`CapÃ­tulo ${chapterIndex + 1} â€” ${titleSeed}`, 90);
+        const timelineContent = truncateText([summary, ...recentEvents.slice(0, 3)].filter(Boolean).join(' '), 260);
+        if (!timelineContent) return output;
+
+        return {
+            ...output,
+            newCodex: {
+                factions: output.newCodex?.factions ?? [],
+                rules: output.newCodex?.rules ?? [],
+                timeline: [{ title: timelineTitle, content: timelineContent }],
+            },
+        };
+    })();
+
     let updatedUniverse: Universe = {
         ...universe,
         codex: {
@@ -3315,10 +3420,10 @@ const applyChroniclerSideEffects = (
         },
     };
 
-    applyChroniclerOutput(updatedUniverse, output, chapterId);
-    updateNarrativeMemoryFromChronicler(updatedUniverse, output, chapterIndex);
+    applyChroniclerOutput(updatedUniverse, normalizedOutput, chapterId);
+    updateNarrativeMemoryFromChronicler(updatedUniverse, normalizedOutput, chapterIndex);
 
-    const mentionedByName = new Set((output.characterUpdates || []).map(cu => normalizeTitle(cu.name)));
+    const mentionedByName = new Set((normalizedOutput.characterUpdates || []).map(cu => normalizeTitle(cu.name)));
     const currentCharacters = updatedUniverse.characters.map(character => {
         if (!mentionedByName.has(normalizeTitle(character.name)) || character.chapters.includes(chapterId)) {
             return character;
@@ -3331,7 +3436,7 @@ const applyChroniclerSideEffects = (
 
     const existingNames = new Set(currentCharacters.map(c => normalizeTitle(c.name)));
     const newChars: Character[] = [];
-    for (const cu of output.characterUpdates || []) {
+    for (const cu of normalizedOutput.characterUpdates || []) {
         const normalizedName = normalizeTitle(cu.name);
         const isNew = !cu.characterId || cu.characterId === 'id' || cu.characterId === 'unknown' || cu.characterId.startsWith('NEW_');
         if (isNew && cu.name && !existingNames.has(normalizedName)) {
@@ -3400,6 +3505,7 @@ const applyChroniclerOutput = (universe: Universe, output: ChroniclerOutput, cha
     if (newRules.length) universe.codex.rules.push(...newRules.map(r => ensureCodexEntryDefaults({
         id: generateId(),
         ...r,
+        ruleKind: inferRuleEntryKind(r.title, r.content),
         relatedEntityIds: inferRelatedEntityIds(universe, `${r.title} ${r.content}`),
         truth: createTruthBundle(`rule:${normalizeTitle(r.title)}`, r.content, chapterId, truncateText(r.content, 180)),
     })));
@@ -3408,6 +3514,8 @@ const applyChroniclerOutput = (universe: Universe, output: ChroniclerOutput, cha
         ...t,
         eventState: inferTimelineEventState(t.title, t.content),
         discoveryKind: inferTimelineDiscoveryKind(t.title, t.content),
+        timelineImpact: inferTimelineImpact(t.title, t.content),
+        timelineScope: inferTimelineScope(t.title, t.content),
         relatedEntityIds: inferRelatedEntityIds(universe, `${t.title} ${t.content}`),
         truth: createTruthBundle(`timeline:${normalizeTitle(t.title)}`, t.content, chapterId, truncateText(t.content, 180)),
     })));
@@ -3502,12 +3610,12 @@ export const generateCharacter = async (universeName: string, lang?: 'pt' | 'en'
         imageUrl: createPortraitUrl({
             name: fallbackName,
             role: String(data.role || 'Coadjuvante'),
-            faction: data.faction || 'Unknown',
+            faction: (data.faction || '').trim(),
             seed: `${fallbackName}|${data.bio || ''}`,
             size: 768,
         }),
         role: (data.role as Character['role']) || 'Coadjuvante',
-        faction: data.faction || 'Unknown',
+        faction: (data.faction || '').trim(),
         status: 'Vivo',
         age: data.age || 25,
         alignment: data.alignment || 'Neutro',
@@ -3602,7 +3710,13 @@ CRITICAL CONTINUITY RULES:
 - Do NOT reset to a new status quo — the previous chapter's consequences carry forward.
 The FORMAT_SPEC in the profile tells you how many scenes fit in a chapter.
 Output a structured plan — do NOT write prose.
-CONCISION MANDATE: Each "beat" field must be ONE sentence, maximum 20 words. No elaboration.`;
+CONCISION MANDATE: Each "beat" field must be ONE sentence, maximum 20 words. No elaboration.
+COMPLETENESS MANDATE:
+- You MUST fill chapterTitle, scenes, chapterSummary, and endHook.
+- chapterSummary must be a full paragraph with at least 2 complete sentences.
+- endHook must be a full sentence that creates immediate forward pull.
+- scenes must contain at least 5 beats.
+- Never leave summary or hook blank.`;
 
     const userPrompt = `
         ${langMandateText}
@@ -3635,7 +3749,62 @@ CONCISION MANDATE: Each "beat" field must be ONE sentence, maximum 20 words. No 
           "chapterSummary": "One paragraph summary of the whole chapter",
           "endHook": "The cliffhanger or question that pulls the reader to the next chapter"
         }
+        All 4 fields are mandatory. If you are unsure, infer the missing parts from the chapter logic instead of leaving them empty.
         `;
+
+    const normalizePlan = (plan: Partial<WeaverPlan> | null | undefined, fallbackLabel: string): WeaverPlan => {
+        const safeScenes = Array.isArray(plan?.scenes)
+            ? plan!.scenes
+                .filter(scene => scene && typeof scene.beat === 'string' && scene.beat.trim().length > 0)
+                .map(scene => ({
+                    beat: scene.beat.trim(),
+                    characters: Array.isArray(scene.characters) ? scene.characters.filter(Boolean) : [],
+                    tension: typeof scene.tension === 'string' && scene.tension.trim().length > 0 ? scene.tension.trim() : 'rising',
+                }))
+            : [];
+
+        const inferredSummary = safeScenes.length > 0
+            ? safeScenes.map(scene => scene.beat).slice(0, 3).join(' ')
+            : params.plotDirection.trim();
+        const inferredHook = safeScenes.length > 0
+            ? safeScenes[safeScenes.length - 1].beat
+            : params.plotDirection.trim();
+
+        return {
+            chapterTitle: plan?.chapterTitle?.trim() || params.title.trim() || fallbackLabel,
+            scenes: safeScenes,
+            chapterSummary: plan?.chapterSummary?.trim() || inferredSummary || (params.lang === 'en' ? 'The chapter develops the chosen conflict and pushes the protagonist into a harder next move.' : 'O capítulo desenvolve o conflito escolhido e empurra o protagonista para um próximo movimento mais difícil.'),
+            endHook: plan?.endHook?.trim() || inferredHook || (params.lang === 'en' ? 'The chapter ends with a new threat already in motion.' : 'O capítulo termina com uma nova ameaça já em movimento.'),
+        };
+    };
+
+    const needsRepair = (plan: WeaverPlan) =>
+        !plan.chapterTitle.trim() ||
+        plan.scenes.length < 3 ||
+        plan.chapterSummary.trim().length < 60 ||
+        plan.endHook.trim().length < 24;
+
+    const repairPlan = async (plan: WeaverPlan, fallbackLabel: string): Promise<WeaverPlan> => {
+        const repaired = await chatJson<WeaverPlan>({
+            system: `${systemPrompt}
+
+You are repairing an incomplete chapter plan.
+Keep the same premise, but fill any missing or weak fields so the plan becomes fully usable.
+Return valid JSON only.`,
+            user: `${userPrompt}
+
+INCOMPLETE PLAN TO REPAIR:
+${JSON.stringify(plan, null, 2)}
+
+Repair it now. Keep the same title direction, but make the summary and hook complete and ensure there are at least 5 useful beats.`,
+            fallback: plan,
+            temperature: 0.35,
+            label: `${fallbackLabel} · Repair`,
+            maxTokens: 800,
+        });
+
+        return normalizePlan(repaired, fallbackLabel);
+    };
 
     // Three calls with increasing temperature to force creative divergence
     const configs = [
@@ -3654,14 +3823,22 @@ CONCISION MANDATE: Each "beat" field must be ONE sentence, maximum 20 words. No 
                 fallback: { chapterTitle: label.split(' · ')[1], scenes: [], chapterSummary: '', endHook: '' },
                 temperature,
                 label,
-                maxTokens: 500,
+                maxTokens: 800,
             })
         )
     );
 
-    emitAgentOutput({ agent: 'weaver', label: 'Weaver · BVSR (3 planos)', status: 'done', summary: `${results.filter(p => p?.chapterTitle).length} planos gerados` });
+    const normalized = await Promise.all(
+        results.map(async (result, index) => {
+            const fallbackLabel = configs[index]?.label.split(' · ')[1] || `Plan ${index + 1}`;
+            const plan = normalizePlan(result, fallbackLabel);
+            return needsRepair(plan) ? repairPlan(plan, fallbackLabel) : plan;
+        })
+    );
 
-    return results.filter((p): p is WeaverPlan => Boolean(p?.chapterTitle));
+    emitAgentOutput({ agent: 'weaver', label: 'Weaver · BVSR (3 planos)', status: 'done', summary: `${normalized.filter(p => p?.chapterTitle).length} planos gerados` });
+
+    return normalized.filter((p): p is WeaverPlan => Boolean(p?.chapterTitle));
 };
 
 /** @deprecated — absorbed by Pass 3 automatic extraction. Kept for backward compat. */
@@ -3805,7 +3982,9 @@ ${issueList}
 ${chapter.content}
 
 Write the full rewritten chapter below. Output continuous prose only — no headers, no numbered sections, no preamble, no closing remarks.`,
+        model: BARD_CEREBRAS_MODEL,
         label: 'Bard · Reescrita',
+        provider: 'cerebras',
     }).catch(() => chapter.content);
 
     return stripLLMPrefixes(prose);

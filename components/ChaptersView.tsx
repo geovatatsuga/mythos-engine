@@ -5,7 +5,7 @@ import Button from './ui/Button';
 import Card from './ui/Card';
 import Modal from './ui/Modal';
 import InlineHelp from './ui/InlineHelp';
-import { Plus, Edit, FileText, Sparkles, BookOpen, Microchip, UserCheck, Search, Save, Eye, RefreshCw, ArrowLeft, CheckCircle2, Globe } from 'lucide-react';
+import { Plus, Edit, FileText, Sparkles, BookOpen, Microchip, UserCheck, Search, Save, Eye, RefreshCw, ArrowLeft, CheckCircle2, Globe, Copy } from 'lucide-react';
 import { generateChapterWithAgents, suggestNextChapterPlot, reviewChapterWithArbiter, rewriteChapterBySuggestions, generateWeaverPlans } from '../services/geminiService';
 import Toast from './ui/Toast';
 import { MeanderDivider } from './ui/MeanderDivider';
@@ -406,6 +406,7 @@ const NarrativeLabModal: React.FC<{
     isLoading: boolean;
 }> = ({ isOpen, onClose, universe, onSubmit, isLoading }) => {
     const { t, lang } = useLanguage();
+    const novelLang = universe.lang ?? universe.storyProfile?.lang ?? 'pt';
     const [params, setParams] = useState<ChapterGenerationParams>({
         title: '',
         plotDirection: '',
@@ -418,6 +419,7 @@ const NarrativeLabModal: React.FC<{
     const [suggestError, setSuggestError] = useState<string | null>(null);
     // BVSR state
     const [step, setStep] = useState<'form' | 'plans'>('form');
+    const [labMode, setLabMode] = useState<'manual' | 'auto'>('manual');
     const [weaverPlans, setWeaverPlans] = useState<WeaverPlan[]>([]);
     const [selectedPlanIdx, setSelectedPlanIdx] = useState<number | null>(null);
     const [isGeneratingPlans, setIsGeneratingPlans] = useState(false);
@@ -440,6 +442,7 @@ const NarrativeLabModal: React.FC<{
     const normalizedFocusOptions = focusOptions.map(option => ({ ...option, value: sanitizeFocusValue(option.value) }));
     const selectedTone = normalizedToneOptions.find(option => option.value === sanitizeToneValue(params.tone)) ?? normalizedToneOptions[3];
     const selectedFocus = normalizedFocusOptions.find(option => option.value === sanitizeFocusValue(params.focus)) ?? normalizedFocusOptions[0];
+    const selectedPlan = selectedPlanIdx !== null ? weaverPlans[selectedPlanIdx] : null;
 
     useEffect(() => {
         setParams(prev => ({
@@ -448,6 +451,16 @@ const NarrativeLabModal: React.FC<{
             focus: sanitizeFocusValue(prev.focus),
         }));
     }, []);
+
+    useEffect(() => {
+        if (!isOpen) {
+            setStep('form');
+            setLabMode('manual');
+            setWeaverPlans([]);
+            setSelectedPlanIdx(null);
+            setPlanError(null);
+        }
+    }, [isOpen]);
 
     const toggleCharacter = (id: string) => {
         setParams(prev => ({
@@ -463,23 +476,34 @@ const NarrativeLabModal: React.FC<{
         onSubmit({
             ...params,
             chapterIndex: chapterPosition === 'end' ? undefined : chapterPosition,
-            lang,
+            lang: novelLang,
         });
     };
 
     const handleGeneratePlans = async () => {
-        if (!params.title || !params.plotDirection) return;
         setIsGeneratingPlans(true);
         setPlanError(null);
         setSelectedPlanIdx(null);
         try {
+            let nextParams = { ...params };
+            if (!nextParams.title.trim() || !nextParams.plotDirection.trim()) {
+                const idea = await suggestNextChapterPlot(universe, chapterPosition === 'end' ? undefined : chapterPosition);
+                nextParams = {
+                    ...nextParams,
+                    title: idea.title,
+                    plotDirection: idea.plot,
+                    activeCharacterIds: idea.activeCharacters.length > 0 ? idea.activeCharacters : nextParams.activeCharacterIds,
+                };
+                setParams(nextParams);
+            }
             const baseParams: ChapterGenerationParams = {
-                ...params,
+                ...nextParams,
                 chapterIndex: chapterPosition === 'end' ? undefined : chapterPosition,
-                lang,
+                lang: novelLang,
             };
             const plans = await generateWeaverPlans(universe, baseParams);
             setWeaverPlans(plans);
+            setSelectedPlanIdx(plans.length > 0 ? 0 : null);
             setStep('plans');
         } catch (e) {
             setPlanError(e instanceof Error ? e.message : t('chapters.errorPlans'));
@@ -490,10 +514,12 @@ const NarrativeLabModal: React.FC<{
 
     const handleWriteWithPlan = () => {
         if (selectedPlanIdx === null) return;
+        setStep('form');
+        onClose();
         onSubmit({
             ...params,
             chapterIndex: chapterPosition === 'end' ? undefined : chapterPosition,
-            lang,
+            lang: novelLang,
             skipWeaver: true,
             prebuiltPlan: weaverPlans[selectedPlanIdx],
         });
@@ -528,7 +554,7 @@ const NarrativeLabModal: React.FC<{
             <div className="space-y-6">
                 <div className="relative overflow-hidden rounded-2xl border border-amber-200/60 bg-gradient-to-br from-stone-950 via-stone-900 to-amber-950 p-5 text-stone-100 shadow-xl">
                     <div className="absolute inset-0 opacity-20 bg-[radial-gradient(circle_at_top_left,_rgba(245,158,11,0.35),_transparent_40%),radial-gradient(circle_at_bottom_right,_rgba(251,191,36,0.18),_transparent_35%)]" />
-                    <div className="relative flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                    <div className="relative flex flex-col gap-4">
                         <div className="space-y-3">
                             <div className="inline-flex items-center gap-2 rounded-full border border-amber-300/20 bg-white/5 px-3 py-1 text-[11px] font-bold uppercase tracking-[0.26em] text-amber-200">
                                 <LoomSigil className="h-3.5 w-3.5" />
@@ -557,20 +583,22 @@ const NarrativeLabModal: React.FC<{
                                 </span>
                             </div>
                         </div>
-                        <button
-                            type="button"
-                            onClick={handleAutoSuggest}
-                            disabled={isSuggesting}
-                            className="group inline-flex items-center justify-center gap-3 self-start rounded-2xl border border-amber-300/30 bg-amber-100 px-5 py-3 text-left text-stone-900 shadow-lg shadow-black/30 transition-all hover:-translate-y-0.5 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-70"
-                        >
-                            <LoomSigil className="h-5 w-5 text-amber-700 transition-transform group-hover:rotate-6" />
-                            <span className="flex flex-col">
-                                <span className="text-[11px] font-bold uppercase tracking-[0.24em] text-amber-700/80">
-                                    {lang === 'en' ? 'Invoke the Weaver' : 'Invocar o Tecelão'}
-                                </span>
-                                <span className="text-sm font-semibold">{isSuggesting ? (lang === 'en' ? 'Weaving plot...' : 'Tecendo enredo...') : t('chapters.modal.autoCta')}</span>
-                            </span>
-                        </button>
+                        <div className="flex flex-wrap gap-2">
+                            <button
+                                type="button"
+                                onClick={() => setLabMode('manual')}
+                                className={`rounded-2xl px-4 py-3 text-sm font-semibold transition-colors ${labMode === 'manual' ? 'bg-amber-100 text-stone-900' : 'border border-white/10 bg-white/5 text-stone-300 hover:bg-white/10'}`}
+                            >
+                                {lang === 'en' ? 'Manual Direction' : 'Direção Manual'}
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setLabMode('auto')}
+                                className={`rounded-2xl px-4 py-3 text-sm font-semibold transition-colors ${labMode === 'auto' ? 'bg-amber-100 text-stone-900' : 'border border-white/10 bg-white/5 text-stone-300 hover:bg-white/10'}`}
+                            >
+                                {lang === 'en' ? 'Auto Weaver' : 'Auto Weaver'}
+                            </button>
+                        </div>
                     </div>
                 </div>
                 {suggestError && (
@@ -580,7 +608,7 @@ const NarrativeLabModal: React.FC<{
                 )}
 
                 {/* Chapter Position Selector */}
-                <div className="rounded-2xl border border-stone-200 bg-stone-50/80 p-4">
+                <div className={labMode === 'auto' ? 'hidden' : 'rounded-2xl border border-stone-200 bg-stone-50/80 p-4'}>
                     <label className="block text-xs font-bold uppercase tracking-widest text-stone-500 mb-1">
                         {t('chapters.chapterPosition')}
                     </label>
@@ -598,30 +626,78 @@ const NarrativeLabModal: React.FC<{
                     </select>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className={labMode === 'auto' ? 'space-y-6' : 'grid grid-cols-1 md:grid-cols-2 gap-6'}>
                     {/* Left Column: Setup */}
                     <div className="space-y-5">
-                        <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
-                            <label className="block text-xs font-bold uppercase tracking-widest text-stone-500 mb-1">{t('chapters.modal.chTitle')}</label>
-                            <input 
-                                type="text" 
-                                className="w-full rounded-xl border border-stone-300 bg-stone-50 px-3 py-3 text-stone-800 focus:outline-none focus:ring-2 focus:ring-primary/40"
-                                placeholder={t('chapters.modal.chPlaceholder')}
-                                value={params.title}
-                                onChange={e => setParams({...params, title: e.target.value})}
-                            />
-                        </div>
-                        <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
-                            <label className="block text-xs font-bold uppercase tracking-widest text-stone-500 mb-1">{t('chapters.modal.plot')}</label>
-                            <textarea 
-                                className="h-32 w-full resize-none rounded-xl border border-stone-300 bg-stone-50 px-3 py-3 text-stone-800 focus:outline-none focus:ring-2 focus:ring-primary/40"
-                                placeholder={t('chapters.modal.plotPlaceholder')}
-                                value={params.plotDirection}
-                                onChange={e => setParams({...params, plotDirection: e.target.value})}
-                            />
-                        </div>
-                         <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
-                            <div className="grid grid-cols-2 gap-4">
+                        {labMode === 'manual' ? (
+                            <>
+                                <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
+                                    <label className="block text-xs font-bold uppercase tracking-widest text-stone-500 mb-1">{t('chapters.modal.chTitle')}</label>
+                                    <input 
+                                        type="text" 
+                                        className="w-full rounded-xl border border-stone-300 bg-stone-50 px-3 py-3 text-stone-800 focus:outline-none focus:ring-2 focus:ring-primary/40"
+                                        placeholder={t('chapters.modal.chPlaceholder')}
+                                        value={params.title}
+                                        onChange={e => setParams({...params, title: e.target.value})}
+                                    />
+                                </div>
+                                <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
+                                    <label className="block text-xs font-bold uppercase tracking-widest text-stone-500 mb-1">{t('chapters.modal.plot')}</label>
+                                    <textarea 
+                                        className="h-32 w-full resize-none rounded-xl border border-stone-300 bg-stone-50 px-3 py-3 text-stone-800 focus:outline-none focus:ring-2 focus:ring-primary/40"
+                                        placeholder={t('chapters.modal.plotPlaceholder')}
+                                        value={params.plotDirection}
+                                        onChange={e => setParams({...params, plotDirection: e.target.value})}
+                                    />
+                                </div>
+                            </>
+                        ) : (
+                            <div className="hidden">
+                                <p className="text-xs font-bold uppercase tracking-widest text-amber-700">
+                                    {lang === 'en' ? 'Auto Weaver Mode' : 'Modo Auto Weaver'}
+                                </p>
+                                <p className="mt-2 text-sm leading-7 text-stone-700">
+                                    {lang === 'en'
+                                        ? 'The Weaver invents the chapter direction first, then brings you 3 plans to choose from.'
+                                        : 'O Weaver inventa a direção do capítulo primeiro e depois traz 3 planos para você escolher.'}
+                                </p>
+                            </div>
+                        )}
+                         {labMode === 'auto' && (
+                            <div className="relative overflow-hidden rounded-[28px] border border-stone-200 bg-white p-6 text-center shadow-[0_24px_70px_rgba(15,15,15,0.08)]">
+                                <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(197,160,89,0.12),transparent_34%),radial-gradient(circle_at_bottom_right,rgba(197,160,89,0.08),transparent_28%)]" />
+                                <div className="absolute left-1/2 top-1/2 h-48 w-48 -translate-x-1/2 -translate-y-1/2 rounded-full border border-amber-200/50 opacity-70 animate-pulse" />
+                                <div className="absolute left-1/2 top-1/2 h-32 w-32 -translate-x-1/2 -translate-y-1/2 rounded-full border border-stone-200 opacity-70" />
+                                <div className="relative mx-auto flex max-w-xl flex-col items-center">
+                                    <div className="mb-8 flex w-full flex-wrap items-start justify-between gap-4 text-left">
+                                        <div>
+                                            <p className="text-[11px] font-bold uppercase tracking-[0.34em] text-stone-500">
+                                                {lang === 'en' ? 'Auto Weaver Mode' : 'Modo Auto Weaver'}
+                                            </p>
+                                            <h3 className="mt-3 font-serif text-3xl text-stone-900">
+                                                {lang === 'en' ? 'Let the Weaver choose the next direction' : 'Deixe o Weaver escolher a próxima direção'}
+                                            </h3>
+                                        </div>
+                                        <Button onClick={handleGeneratePlans} isLoading={isGeneratingPlans} disabled={isLoading} className="rounded-xl bg-stone-900 px-4 py-3 text-amber-50 hover:bg-black">
+                                            <LoomSigil className="mr-2 h-4 w-4 text-amber-300" />
+                                            {lang === 'en' ? 'Generate 3 Plans' : 'Gerar 3 Planos'}
+                                        </Button>
+                                    </div>
+                                    <div className="relative mb-6 flex h-28 w-28 items-center justify-center rounded-full border border-amber-200 bg-amber-50/70 shadow-[0_0_40px_rgba(197,160,89,0.10)]">
+                                        <div className="absolute inset-3 rounded-full border border-amber-200/20" />
+                                        <div className="absolute inset-0 rounded-full bg-[radial-gradient(circle,rgba(197,160,89,0.12),transparent_62%)]" />
+                                        <LoomSigil className="h-12 w-12 text-amber-700" />
+                                    </div>
+                                    <p className="max-w-lg text-sm leading-7 text-stone-600">
+                                        {lang === 'en'
+                                            ? 'The system will invent the chapter direction and immediately bring back 3 plans for you to compare.'
+                                            : 'O sistema vai inventar a direção do capítulo e trazer imediatamente 3 planos para você comparar.'}
+                                    </p>
+                                </div>
+                            </div>
+                         )}
+                         <div className={labMode === 'auto' ? 'hidden' : 'rounded-2xl border border-stone-200 bg-white p-5 shadow-sm'}>
+                            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                             <div>
                                 <label className="mb-1 flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-stone-500">
                                     <span>{t('chapters.modal.tone')}</span>
@@ -632,7 +708,9 @@ const NarrativeLabModal: React.FC<{
                                     value={params.tone}
                                     onChange={e => setParams({...params, tone: e.target.value as any})}
                                 >
-                                    {TONE_VALUES.map(tn => <option key={tn} value={tn}>{getToneLabel(tn, lang)}</option>)}
+                                    {normalizedToneOptions.map(option => (
+                                        <option key={option.value} value={option.value}>{getToneLabel(option.value, lang)}</option>
+                                    ))}
                                 </select>
                             </div>
                             <div>
@@ -645,41 +723,22 @@ const NarrativeLabModal: React.FC<{
                                     value={params.focus}
                                     onChange={e => setParams({...params, focus: e.target.value as any})}
                                 >
-                                    {FOCUS_VALUES.map(fc => <option key={fc} value={fc}>{getFocusLabel(fc, lang)}</option>)}
+                                    {normalizedFocusOptions.map(option => (
+                                        <option key={option.value} value={option.value}>{getFocusLabel(option.value, lang)}</option>
+                                    ))}
                                 </select>
                             </div>
                             </div>
-                            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2">
-                                <div className="relative min-h-[120px] overflow-hidden rounded-2xl border border-amber-300 bg-white p-3 shadow-sm shadow-amber-100">
-                                    <div className={`absolute inset-x-0 top-0 h-1.5 bg-gradient-to-r ${selectedTone.accent}`} />
-                                    <div className="flex items-start gap-3">
-                                        <div className="mt-0.5 flex h-10 w-10 min-w-10 items-center justify-center rounded-full border border-amber-200 bg-amber-50 font-serif text-sm text-amber-700">
-                                            {selectedTone.sigil}
-                                        </div>
-                                        <div className="min-w-0">
-                                            <p className="font-serif text-base leading-tight text-stone-900">{getToneLabel(selectedTone.value, lang)}</p>
-                                            <p className="mt-1 text-xs leading-relaxed text-stone-500">{selectedTone.description[lang]}</p>
-                                        </div>
-                                    </div>
-                                </div>
-                                <div className="relative min-h-[120px] overflow-hidden rounded-2xl border border-stone-900 bg-white p-3 shadow-sm shadow-stone-200">
-                                    <div className={`absolute inset-x-0 top-0 h-1.5 bg-gradient-to-r ${selectedFocus.accent}`} />
-                                    <div className="flex items-start gap-3">
-                                        <div className="mt-0.5 flex h-10 min-w-10 items-center justify-center rounded-full border border-stone-300 bg-stone-900 px-2 font-serif text-xs text-amber-100">
-                                            {selectedFocus.sigil}
-                                        </div>
-                                        <div className="min-w-0">
-                                            <p className="font-serif text-base leading-tight text-stone-900">{getFocusLabel(selectedFocus.value, lang)}</p>
-                                            <p className="mt-1 text-xs leading-relaxed text-stone-500">{selectedFocus.description[lang]}</p>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
+                            <p className="mt-4 text-xs leading-6 text-stone-500">
+                                {lang === 'en'
+                                    ? 'Choose the emotional temperature and the dominant scene driver. The engine will use them as a soft guide, not a rigid template.'
+                                    : 'Escolha a temperatura emocional e o motor principal da cena. O motor usa isso como guia leve, n?o como molde r?gido.'}
+                            </p>
                         </div>
                     </div>
 
                     {/* Right Column: Characters */}
-                    <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
+                    <div className={labMode === 'auto' ? 'hidden' : 'rounded-2xl border border-stone-200 bg-white p-5 shadow-sm'}>
                          <label className="mb-2 flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-stone-500">
                             <span>{t('chapters.modal.chars')}</span>
                             <InlineHelp content={t('help.chapters.activeCharacters')} />
@@ -708,16 +767,18 @@ const NarrativeLabModal: React.FC<{
 
                 <div className="flex justify-between items-center pt-4 border-t border-stone-200 gap-3">
                     <div className="flex items-center gap-2">
-                        <Button variant="ghost" size="sm" onClick={handleSubmit} isLoading={isLoading} disabled={!params.title || !params.plotDirection} className="rounded-xl border border-stone-300 bg-stone-50 px-4 py-3 text-stone-700 hover:border-stone-500 hover:bg-white">
+                        <Button variant="ghost" size="sm" onClick={handleSubmit} isLoading={isLoading} disabled={labMode === 'auto' || !params.title || !params.plotDirection} className={labMode === 'auto' ? 'hidden' : 'rounded-xl border border-stone-300 bg-stone-50 px-4 py-3 text-stone-700 hover:border-stone-500 hover:bg-white'}>
                             <BardSeal className="mr-2 h-4 w-4 text-primary" />
                             {t('chapters.writeDirect')}
                         </Button>
-                        <InlineHelp content={t('help.chapters.writeDirect')} />
+                        {labMode !== 'auto' && <InlineHelp content={t('help.chapters.writeDirect')} />}
                     </div>
                     <div className="flex items-center gap-2">
-                        <Button onClick={handleGeneratePlans} isLoading={isGeneratingPlans} disabled={isLoading || !params.title || !params.plotDirection} className="rounded-xl bg-stone-900 px-4 py-3 text-amber-50 hover:bg-black">
+                        <Button onClick={handleGeneratePlans} isLoading={isGeneratingPlans} disabled={isLoading} className={labMode === 'auto' ? 'hidden' : 'rounded-xl bg-stone-900 px-4 py-3 text-amber-50 hover:bg-black'}>
                             <LoomSigil className="mr-2 h-4 w-4 text-amber-300" />
-                            {t('chapters.generate3Plans')}
+                            {labMode === 'auto'
+                                ? (lang === 'en' ? 'Let Weaver Create 3 Plans' : 'Deixar o Weaver Criar 3 Planos')
+                                : t('chapters.generate3Plans')}
                         </Button>
                         <InlineHelp content={t('help.chapters.generatePlans')} />
                     </div>
@@ -733,63 +794,116 @@ const NarrativeLabModal: React.FC<{
         {/* Plan Selector — second step, separate modal */}
         <Modal isOpen={step === 'plans'} onClose={() => setStep('form')} title={t('chapters.choosePlan')}>
             <div className="space-y-4">
-                <p className="text-xs text-stone-500">
+                <p className="text-sm leading-6 text-stone-500">
                     {t('chapters.choosePlanDesc')}
                 </p>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    {weaverPlans.map((plan, idx) => {
-                        const label = ['A', 'B', 'C'][idx];
-                        const isSelected = selectedPlanIdx === idx;
-                        return (
-                            <button
-                                key={idx}
-                                onClick={() => setSelectedPlanIdx(idx)}
-                                className={`text-left p-4 rounded-xl border-2 transition-all duration-200 flex flex-col gap-2 ${
-                                    isSelected
-                                        ? 'border-primary bg-primary/5 shadow-md shadow-primary/10'
-                                        : 'border-stone-200 bg-stone-50 hover:border-stone-400'
-                                }`}
-                            >
-                                <div className="flex items-center justify-between">
-                                    <span className="text-[10px] font-bold uppercase tracking-widest text-stone-400">
-                                        {`${t('chapters.planLabel')} ${label}`}
-                                    </span>
-                                    {isSelected && <CheckCircle2 className="w-4 h-4 text-primary" />}
-                                </div>
-                                <h4 className="font-serif font-bold text-stone-800 text-sm leading-tight">
-                                    {plan.chapterTitle}
-                                </h4>
-                                <div className="flex flex-wrap gap-1">
-                                    {(plan.scenes || []).slice(0, 4).map((s, si) => (
-                                        <span
-                                            key={si}
-                                            className={`text-[9px] px-1.5 py-0.5 rounded font-medium uppercase tracking-wide ${
-                                                s.tension === 'peak' ? 'bg-red-100 text-red-600'
-                                                : s.tension === 'rising' ? 'bg-amber-100 text-amber-700'
-                                                : 'bg-blue-100 text-blue-600'
-                                            }`}
-                                        >
-                                            {s.tension}
+                <div className="grid grid-cols-1 gap-4 xl:grid-cols-[290px_1fr]">
+                    <div className="space-y-3">
+                        {weaverPlans.map((plan, idx) => {
+                            const label = ['A', 'B', 'C'][idx];
+                            const isSelected = selectedPlanIdx === idx;
+                            return (
+                                <button
+                                    key={idx}
+                                    onClick={() => setSelectedPlanIdx(idx)}
+                                    className={`w-full text-left p-4 rounded-2xl border-2 transition-all duration-200 flex flex-col gap-3 ${
+                                        isSelected
+                                            ? 'border-primary bg-primary/5 shadow-md shadow-primary/10'
+                                            : 'border-stone-200 bg-white hover:border-stone-400'
+                                    }`}
+                                >
+                                    <div className="flex items-center justify-between">
+                                        <span className="text-[11px] font-bold uppercase tracking-[0.24em] text-stone-400">
+                                            {`${t('chapters.planLabel')} ${label}`}
                                         </span>
-                                    ))}
-                                    {(plan.scenes?.length ?? 0) > 4 && (
-                                        <span className="text-[9px] text-stone-400">+{(plan.scenes?.length ?? 0) - 4}</span>
-                                    )}
-                                </div>
-                                <p className="text-[11px] text-stone-500 leading-relaxed line-clamp-3">
-                                    {plan.chapterSummary}
-                                </p>
-                                <div className="border-t border-stone-200 pt-2 mt-auto">
-                                    <p className="text-[10px] font-semibold text-stone-400 uppercase tracking-widest mb-0.5">
-                                        Hook
+                                        {isSelected && <CheckCircle2 className="w-4 h-4 text-primary" />}
+                                    </div>
+                                    <h4 className="font-serif font-bold text-stone-900 text-lg leading-tight">
+                                        {plan.chapterTitle}
+                                    </h4>
+                                    <div className="flex flex-wrap gap-1.5">
+                                        {(plan.scenes || []).slice(0, 4).map((s, si) => (
+                                            <span
+                                                key={si}
+                                                className={`text-[10px] px-2 py-1 rounded-full font-semibold uppercase tracking-[0.18em] ${
+                                                    s.tension === 'peak' ? 'bg-red-100 text-red-600'
+                                                    : s.tension === 'rising' ? 'bg-amber-100 text-amber-700'
+                                                    : 'bg-blue-100 text-blue-600'
+                                                }`}
+                                            >
+                                                {s.tension}
+                                            </span>
+                                        ))}
+                                        {(plan.scenes?.length ?? 0) > 4 && (
+                                            <span className="text-[10px] text-stone-400">+{(plan.scenes?.length ?? 0) - 4}</span>
+                                        )}
+                                    </div>
+                                    <p className="text-sm text-stone-500 leading-6 line-clamp-3">
+                                        {plan.chapterSummary}
                                     </p>
-                                    <p className="text-[11px] text-stone-600 italic line-clamp-2">
-                                        {plan.endHook}
+                                </button>
+                            );
+                        })}
+                    </div>
+                    <div className="rounded-[26px] border border-stone-200 bg-white p-5 shadow-sm">
+                        {selectedPlan ? (
+                            <div className="space-y-4">
+                                <div className="border-b border-stone-200 pb-3">
+                                    <p className="text-[11px] font-bold uppercase tracking-[0.24em] text-stone-400">
+                                        {`${t('chapters.planLabel')} ${['A', 'B', 'C'][selectedPlanIdx ?? 0]}`}
                                     </p>
+                                    <h3 className="mt-2 font-serif text-2xl leading-tight text-stone-900">{selectedPlan.chapterTitle}</h3>
                                 </div>
-                            </button>
-                        );
-                    })}
+                                <div className="grid gap-4 lg:grid-cols-[1.15fr_0.85fr]">
+                                <div>
+                                    <p className="text-[11px] font-bold uppercase tracking-[0.24em] text-stone-400">
+                                        {lang === 'en' ? 'What this route does' : 'O que esta rota faz'}
+                                    </p>
+                                    <p className="mt-2 text-[15px] leading-7 text-stone-700">{selectedPlan.chapterSummary}</p>
+                                </div>
+                                <div>
+                                    <p className="text-[11px] font-bold uppercase tracking-[0.24em] text-stone-400">
+                                        {lang === 'en' ? 'Key beats' : 'Batidas-chave'}
+                                    </p>
+                                    <div className="mt-3 space-y-2.5">
+                                        {(selectedPlan.scenes || []).slice(0, 3).map((scene, idx) => (
+                                            <div key={`${scene.beat}-${idx}`} className="rounded-2xl border border-stone-200 bg-stone-50 px-4 py-3">
+                                                <div className="flex items-center justify-between gap-3">
+                                                    <span className="text-xs font-bold uppercase tracking-[0.2em] text-stone-400">
+                                                        {lang === 'en' ? `Beat ${idx + 1}` : `Beat ${idx + 1}`}
+                                                    </span>
+                                                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] ${
+                                                        scene.tension === 'peak' ? 'bg-red-100 text-red-600'
+                                                        : scene.tension === 'rising' ? 'bg-amber-100 text-amber-700'
+                                                        : 'bg-blue-100 text-blue-600'
+                                                    }`}>
+                                                        {scene.tension}
+                                                    </span>
+                                                </div>
+                                                <p className="mt-2 text-sm leading-6 text-stone-700">{scene.beat}</p>
+                                            </div>
+                                        ))}
+                                        {(selectedPlan.scenes?.length ?? 0) > 3 && (
+                                            <p className="text-xs text-stone-400">
+                                                {lang === 'en'
+                                                    ? `+ ${(selectedPlan.scenes?.length ?? 0) - 3} more beats in the full plan`
+                                                    : `+ ${(selectedPlan.scenes?.length ?? 0) - 3} beats a mais no plano completo`}
+                                            </p>
+                                        )}
+                                    </div>
+                                </div>
+                                </div>
+                                <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-4">
+                                    <p className="text-[11px] font-bold uppercase tracking-[0.24em] text-amber-700">Hook</p>
+                                    <p className="mt-2 text-[15px] leading-7 text-stone-800 italic">{selectedPlan.endHook}</p>
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="flex min-h-[260px] items-center justify-center text-center text-stone-400">
+                                <p>{lang === 'en' ? 'Select one of the three plans to inspect it in detail.' : 'Selecione um dos três planos para inspecioná-lo em detalhe.'}</p>
+                            </div>
+                        )}
+                    </div>
                 </div>
                 <div className="flex justify-between items-center pt-4 border-t border-stone-200">
                     <Button variant="ghost" size="sm" onClick={() => setStep('form')}>
@@ -845,6 +959,60 @@ export default function ChaptersView({ universe, onGenerateChapter: _legacyGener
             setSelectedChapter(universe.chapters[universe.chapters.length - 1] ?? null);
         }
     }, [universe.chapters, selectedChapter]);
+
+    const buildNovelExportText = () => {
+        const universeName = typeof universe.name === 'string' && universe.name.trim().length > 0
+            ? universe.name.trim()
+            : t('chapters.exportNovelUntitled');
+        const subtitle = typeof universe.subtitle === 'string' && universe.subtitle.trim().length > 0
+            ? universe.subtitle.trim()
+            : '';
+        const description = typeof universe.description === 'string' && universe.description.trim().length > 0
+            ? universe.description.trim()
+            : '';
+
+        const chapterBlocks = universe.chapters.map((chapter, index) => {
+            const title = typeof chapter.title === 'string' && chapter.title.trim().length > 0
+                ? chapter.title.trim()
+                : `${t('chapters.exportChapterLabel')} ${index + 1}`;
+            const summary = typeof chapter.summary === 'string' && chapter.summary.trim().length > 0
+                ? chapter.summary.trim()
+                : '';
+            const content = typeof chapter.content === 'string' && chapter.content.trim().length > 0
+                ? chapter.content.trim()
+                : t('chapters.exportChapterEmpty');
+
+            return [
+                `${t('chapters.exportChapterLabel')} ${index + 1}: ${title}`,
+                summary ? `${t('chapters.exportChapterSummary')}: ${summary}` : '',
+                '',
+                content,
+            ].filter(Boolean).join('\n');
+        });
+
+        return [
+            universeName,
+            subtitle,
+            description,
+            '',
+            ...chapterBlocks,
+        ].filter(Boolean).join('\n\n').trim();
+    };
+
+    const handleCopyWholeNovel = async () => {
+        if (universe.chapters.length === 0) {
+            setToast({ msg: t('chapters.exportNovelEmpty'), type: 'error' });
+            return;
+        }
+
+        try {
+            await navigator.clipboard.writeText(buildNovelExportText());
+            setToast({ msg: t('chapters.exportNovelDone'), type: 'success' });
+        } catch (error) {
+            console.error('[Copy Novel Error]', error);
+            setToast({ msg: t('chapters.exportNovelFailed'), type: 'error' });
+        }
+    };
 
     const handleAgentGeneration = async (params: ChapterGenerationParams) => {
         setLocalLoading(true);
@@ -951,6 +1119,29 @@ export default function ChaptersView({ universe, onGenerateChapter: _legacyGener
                             {t('chapters.emptyArchives')}
                         </div>
                     )}
+                </Card>
+                <Card className="mt-4 p-4 bg-paper border-stone-200 shadow-sm">
+                    <div className="flex items-start justify-between gap-3">
+                        <div>
+                            <h3 className="text-sm font-serif font-semibold text-stone-dark">
+                                {t('chapters.exportNovel')}
+                            </h3>
+                            <p className="mt-1 text-xs leading-relaxed text-stone-500">
+                                {t('chapters.exportNovelDesc')}
+                            </p>
+                        </div>
+                        <span className="inline-flex items-center rounded-full border border-stone-200 bg-stone-50 px-2 py-1 text-[10px] font-bold uppercase tracking-[0.24em] text-stone-500">
+                            {universe.chapters.length} {t('chapters.exportNovelCount')}
+                        </span>
+                    </div>
+                    <Button
+                        onClick={handleCopyWholeNovel}
+                        disabled={universe.chapters.length === 0}
+                        className="mt-4 w-full bg-stone-800 hover:bg-black text-white disabled:bg-stone-300 disabled:text-stone-500"
+                    >
+                        <Copy className="mr-2 h-4 w-4 text-primary" />
+                        {t('chapters.exportNovelCta')}
+                    </Button>
                 </Card>
             </aside>
             <main className="lg:col-span-3 min-h-0 h-full">

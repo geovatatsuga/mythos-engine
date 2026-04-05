@@ -424,7 +424,7 @@ export const RelationshipConstellation: React.FC<{
         const b = safeCharacters[j];
         const sharedChapters = a.chapters.filter(ch => b.chapters.includes(ch)).length;
         const sameFaction = Boolean(a.faction && b.faction && a.faction === b.faction);
-        if (sharedChapters === 0 && !sameFaction) continue;
+        if (sharedChapters === 0) continue;
         const connection = ensureConnection(a.id, b.id);
         connection.sharedChapters = Math.max(connection.sharedChapters, sharedChapters);
         connection.sameFaction = connection.sameFaction || sameFaction;
