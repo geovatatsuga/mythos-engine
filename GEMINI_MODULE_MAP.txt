@@ -1,0 +1,238 @@
+MYTHOS ENGINE
+Gemini Module Map
+Updated: 2026-04-09
+
+Purpose
+This file documents where each Gemini pipeline responsibility lives so another AI or developer can quickly find the right file.
+
+Root Entry Point
+- services/geminiService.ts
+  Public facade used by the app.
+  Re-exports the modular Gemini files.
+
+Primary Folder
+- services/gemini/
+  Main folder for the modular Gemini pipeline.
+
+Files In services/gemini
+
+1. pubsub.ts
+- Path: services/gemini/pubsub.ts
+- Responsibility:
+  Token usage events.
+  Agent output events.
+  Subscriptions for pipeline logs and telemetry.
+- Use when:
+  You need to inspect or change emitted pipeline events.
+
+2. canon.ts
+- Path: services/gemini/canon.ts
+- Responsibility:
+  Canon defaults.
+  Tracking defaults.
+  Truth bundles.
+  Alias normalization.
+  Mention collection.
+  Codex and universe normalization.
+  Dirty scope and canon sync helpers.
+- Use when:
+  You need to change codex state, tracking, truth, sync, or canonical data repair.
+
+3. llm.ts
+- Path: services/gemini/llm.ts
+- Responsibility:
+  LLM provider access and fallback routing.
+  Shared model helpers.
+  chat and chatJson.
+  zod schemas for structured AI outputs.
+  language cleanup and text repair.
+  longform blueprint helper functions.
+- Main things here:
+  Provider selection.
+  OpenRouter/Gemini/Cerebras/Groq runtime helpers.
+  JSON repair/parsing.
+  Longform blueprint normalization and fallback blueprint generation.
+- Use when:
+  You need to change model behavior, API fallback behavior, JSON parsing, or shared structured output rules.
+
+4. context.ts
+- Path: services/gemini/context.ts
+- Responsibility:
+  Prompt context builders and formatting helpers.
+  World context.
+  Character context.
+  Story context.
+  Memory context.
+  Bard memory hints.
+  Opening style selection.
+  Repetition cleanup helpers.
+  Small creative seed helpers used by genesis.
+- Use when:
+  You need to change what an agent sees in prompts.
+
+5. genesis.ts
+- Path: services/gemini/genesis.ts
+- Responsibility:
+  Early creation flow.
+  Universe idea generation.
+  Architect anchor generation.
+  Soulforger protagonist generation.
+  Genesis chapter bootstrap.
+  Divine genesis and longform genesis base setup.
+  Placeholder image generation.
+- Agents touched here:
+  Architect.
+  Soulforger.
+- Use when:
+  The bug happens during initial universe creation or right after Architect/Soulforger.
+
+6. chapterPipeline.ts
+- Path: services/gemini/chapterPipeline.ts
+- Responsibility:
+  Main chapter generation runtime.
+  Director guidance.
+  Weaver chapter planning.
+  Bard prose writing.
+  Lector surgical revision.
+  Chronicler extraction.
+  Arbiter review and rewrite helpers.
+  Character suggestion and weaver plan generation.
+  Narrative memory application after chapters.
+- Agents touched here:
+  Director.
+  Weaver.
+  Bard.
+  Lector.
+  Chronicler.
+  Arbiter.
+- Use when:
+  A bug happens while generating or refining a chapter.
+
+7. longform.ts
+- Path: services/gemini/longform.ts
+- Responsibility:
+  Longform blueprint creation for the whole story.
+  Longform act/chapter map refinement.
+  Autogen longform loop.
+  Story arc loop.
+  Longform safety fallbacks and loop abort protection.
+- Agents touched here:
+  Weaver longform blueprint.
+  Director in longform loop.
+  Chapter pipeline during autogen.
+- Use when:
+  The issue is in full-story planning or longform automatic generation.
+
+8. workflows.ts
+- Path: services/gemini/workflows.ts
+- Responsibility:
+  Barrel file for modular workflow exports.
+- Use when:
+  You need one place that re-exports context/genesis/chapterPipeline/longform.
+
+Typical Runtime Paths
+
+A. Initial Universe Creation
+1. services/geminiService.ts
+2. services/gemini/workflows.ts
+3. services/gemini/genesis.ts
+4. services/gemini/context.ts
+5. services/gemini/llm.ts
+6. services/gemini/canon.ts
+
+B. Genesis With First Story Material
+1. Architect in genesis.ts
+2. Soulforger in genesis.ts
+3. Chapter bootstrap via chapterPipeline.ts
+4. Chronicler side effects applied back into canon.ts helpers
+
+C. Single Chapter Generation
+1. services/gemini/chapterPipeline.ts
+2. Director guidance
+3. Weaver planner
+4. Bard writing
+5. Lector revision
+6. Chronicler extraction
+7. Canon update via canon.ts helpers
+
+D. Longform Full Story Blueprint
+1. services/gemini/longform.ts
+2. llm.ts blueprint schemas and fallback helpers
+3. context.ts blueprint context
+4. canon.ts normalized universe state
+
+E. Longform Auto Generation
+1. services/gemini/longform.ts
+2. generateDirectorGuidance from chapterPipeline.ts
+3. generateChapterWithAgents from chapterPipeline.ts
+4. canon.ts normalization and memory sync
+
+Where To Look First By Symptom
+
+- Crash after Architect:
+  services/gemini/genesis.ts
+  services/gemini/canon.ts
+
+- Crash during Soulforger:
+  services/gemini/genesis.ts
+  services/gemini/llm.ts
+
+- Crash during longform blueprint:
+  services/gemini/longform.ts
+  services/gemini/llm.ts
+
+- Chapter plan is bad:
+  services/gemini/chapterPipeline.ts
+  services/gemini/context.ts
+
+- Prose output is bad:
+  services/gemini/chapterPipeline.ts
+  services/gemini/context.ts
+  services/gemini/llm.ts
+
+- Codex or memory updates are wrong:
+  services/gemini/chapterPipeline.ts
+  services/gemini/canon.ts
+
+- Pipeline events or exported logs are wrong:
+  services/gemini/pubsub.ts
+
+Important Public Functions By Area
+
+- In genesis.ts
+  generateUniverseIdea
+  createNewUniverse
+  generateFullUniverseGenesis
+  generateLongformGenesisBase
+  generateDivineGenesis
+  generateImage
+
+- In chapterPipeline.ts
+  generateChapterWithAgents
+  generateDirectorGuidance
+  generateCharacter
+  suggestNextChapterPlot
+  generateWeaverPlans
+  extractLoreFromChapter
+  reviewChapterWithArbiter
+  rewriteChapterBySuggestions
+
+- In longform.ts
+  generateLongformBlueprint
+  runAutogenLongform
+  generateStoryArc
+
+- In llm.ts
+  chat
+  chatJson
+  langMandate
+  repairTextArtifacts
+  normalizeLongformBlueprint
+  buildFallbackLongformBlueprint
+
+Notes For Another AI
+- If you need the full story planner, start in services/gemini/longform.ts.
+- If you need per-chapter agents, start in services/gemini/chapterPipeline.ts.
+- If a value looks malformed but the call did not crash, inspect services/gemini/llm.ts first.
+- If state mutates incorrectly after generation, inspect services/gemini/canon.ts and the chronicler application path in chapterPipeline.ts.
+- services/geminiService.ts should stay thin. New logic should usually go into services/gemini/.
